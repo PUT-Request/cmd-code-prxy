@@ -126,16 +126,9 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 }
 
 // CreateUpstreamRequest creates a new HTTP request to the CommandCode API
-func (p *Proxy) CreateUpstreamRequest(ctx context.Context, ccBody api.CCRequestBody, apiKey string) (*http.Request, error) {
-	reqJSON, err := json.Marshal(ccBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to build request: %w", err)
-	}
-
-	p.debugf("[DEBUG] CommandCode request body: %s", truncateLog(string(reqJSON)))
-
+func (p *Proxy) CreateUpstreamRequest(ctx context.Context, ccBody api.CCRequestBody, apiKey string, bodyJSON []byte) (*http.Request, error) {
 	ccReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		p.BaseURL+"/alpha/generate", bytes.NewReader(reqJSON))
+		p.BaseURL+"/alpha/generate", bytes.NewReader(bodyJSON))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create upstream request: %w", err)
 	}
@@ -165,15 +158,14 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get API key from client Authorization header or server default
-	apiKey := r.Header.Get("Authorization")
-	if apiKey != "" {
-		apiKey = strings.TrimPrefix(apiKey, "Bearer ")
-		apiKey = strings.TrimSpace(apiKey)
-	} else if p.APIKey != "" {
+	// Get CommandCode API key from the optional x-command-code-api-key header
+	// or fall back to the server's configured default.
+	apiKey := strings.TrimSpace(r.Header.Get("x-command-code-api-key"))
+	if apiKey == "" {
 		apiKey = p.APIKey
-	} else {
-		p.writeOpenAIError(w, http.StatusUnauthorized, "API key required. Set Authorization header.", "authentication_error")
+	}
+	if apiKey == "" {
+		p.writeOpenAIError(w, http.StatusUnauthorized, "CommandCode API key required. Set x-command-code-api-key header or configure api_key.", "authentication_error")
 		return
 	}
 
@@ -204,23 +196,64 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create upstream request
-	ccReq, err := p.CreateUpstreamRequest(r.Context(), ccBody, apiKey)
+	// Marshal request body once so we can retry on 503
+	reqJSON, err := json.Marshal(ccBody)
 	if err != nil {
-		p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to create upstream request", "server_error")
+		p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to build request", "server_error")
 		return
 	}
+	p.debugf("[DEBUG] CommandCode request body: %s", truncateLog(string(reqJSON)))
 
-	// Call upstream
-	ccResp, err := p.CallUpstream(ccReq)
-	if err != nil {
-		p.writeOpenAIError(w, http.StatusBadGateway, err.Error(), "api_error")
-		return
-	}
-	defer ccResp.Body.Close()
+	retryDelays := []time.Duration{0, 10 * time.Second, 20 * time.Second}
+	maxRetries := len(retryDelays)
+	var ccResp *http.Response
 
-	if ccResp.StatusCode != http.StatusOK {
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		// Wait before retry (delay is 0 for the first attempt)
+		if attempt > 0 {
+			delay := retryDelays[attempt-1]
+			log.Printf("[RETRY] Attempt %d/%d after %v backoff", attempt+1, maxRetries+1, delay)
+			select {
+			case <-r.Context().Done():
+				p.writeOpenAIError(w, http.StatusRequestTimeout, "Client disconnected during retry", "api_error")
+				return
+			case <-time.After(delay):
+			}
+		}
+
+		// Create a fresh upstream request for each attempt
+		ccReq, err := p.CreateUpstreamRequest(r.Context(), ccBody, apiKey, reqJSON)
+		if err != nil {
+			p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to create upstream request", "server_error")
+			return
+		}
+
+		ccResp, err = p.CallUpstream(ccReq)
+		if err != nil {
+			if r.Context().Err() != nil {
+				p.writeOpenAIError(w, http.StatusRequestTimeout, "Client disconnected", "api_error")
+				return
+			}
+			p.writeOpenAIError(w, http.StatusBadGateway, err.Error(), "api_error")
+			return
+		}
+
+		// Success — proceed
+		if ccResp.StatusCode == http.StatusOK {
+			break
+		}
+
+		// 503 — retry if we have attempts left
+		if ccResp.StatusCode == http.StatusServiceUnavailable && attempt < maxRetries {
+			errBody, _ := io.ReadAll(ccResp.Body)
+			ccResp.Body.Close()
+			log.Printf("[RETRY] Upstream returned 503 (attempt %d/%d): %s", attempt+1, maxRetries+1, string(errBody))
+			continue
+		}
+
+		// Non-retryable error — return immediately
 		errBody, _ := io.ReadAll(ccResp.Body)
+		ccResp.Body.Close()
 		message := fmt.Sprintf("Upstream error: %s", string(errBody))
 		log.Printf("[ERROR] Upstream returned %d: %s", ccResp.StatusCode, string(errBody))
 		status := http.StatusBadGateway
@@ -230,6 +263,7 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		p.writeOpenAIError(w, status, message, "api_error")
 		return
 	}
+	defer ccResp.Body.Close()
 
 	requestID := "chatcmpl-" + uuid.New().String()[:29]
 	created := time.Now().Unix()
@@ -292,6 +326,26 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 				Model:   model,
 				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
 			})
+
+		case "reasoning-delta":
+			if event.Text == "" {
+				continue
+			}
+			delta := api.OpenAIDelta{ReasoningContent: event.Text}
+			if !sentRole {
+				delta.Role = "assistant"
+				sentRole = true
+			}
+			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
+				ID:      requestID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []api.OpenAIChoice{{Index: 0, Delta: &delta}},
+			})
+
+		case "reasoning-start", "reasoning-end":
+			// No user-visible content, skip silently
 
 		case "tool-use":
 			toolCalls := []api.OpenAIDeltaToolCall{{
@@ -443,6 +497,7 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
 
 	var content strings.Builder
+	var reasoningContent strings.Builder
 	var inputTokens, outputTokens int
 	var hasToolCalls bool
 	var toolCalls []api.ToolCall
@@ -464,6 +519,10 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 		switch event.Type {
 		case "text-delta":
 			content.WriteString(event.Text)
+		case "reasoning-delta":
+			reasoningContent.WriteString(event.Text)
+		case "reasoning-start", "reasoning-end":
+			// No user-visible content, skip silently
 		case "tool-use":
 			hasToolCalls = true
 			toolCallByID[event.ToolCallID] = len(toolCalls)
@@ -535,6 +594,10 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 	msg := &api.OpenAIMessage{
 		Role:    "assistant",
 		Content: content.String(),
+	}
+	if reasoningContent.Len() > 0 {
+		rc := reasoningContent.String()
+		msg.ReasoningContent = &rc
 	}
 	finishReason := "stop"
 	if hasToolCalls {

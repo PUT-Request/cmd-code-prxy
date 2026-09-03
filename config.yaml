@@ -1,0 +1,17 @@
+# CommandCode Proxy Server configuration
+
+# Host and port the proxy listens on.
+host: 127.0.0.1
+port: 55990
+
+# Default CommandCode API key used for upstream requests.
+# Clients can override it per-request with the `x-command-code-api-key` header.
+api_key: ""
+
+# API key required to access the exposed API endpoints.
+# Clients must send it as: Authorization: Bearer <server_api_key>
+# This is mandatory - the server will refuse to start without it.
+server_api_key: "change-me"
+
+# Enable verbose debug logging of request/response bodies.
+debug: false

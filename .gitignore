@@ -14,3 +14,9 @@
 # OS files
 .DS_Store
 Thumbs.db
+
+# Build outputs / binaries
+/bin/
+/dist/
+*.exe
+*.zip
