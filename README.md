@@ -1,8 +1,8 @@
-# CommandCode Proxy Server
+# CommandCode Proxy Server (Prod edition)
 
 OpenAI-compatible proxy server for the CommandCode API. It exposes `/v1/chat/completions` and `/v1/models` endpoints so OpenAI-compatible clients can call CommandCode models through a local HTTP server.
 
-Repository: https://github.com/dev2k6/command-code-proxy-server
+Forked from: https://github.com/dev2k6/command-code-proxy-server
 
 Version: `v1.0.8`
 
@@ -12,7 +12,7 @@ Version: `v1.0.8`
 - Streaming and non-streaming responses
 - OpenAI-compatible model list endpoint
 - Short model name mapping
-- YAML configuration file (`config.yaml`)
+- YAML configuration file (`config.yaml`) (Not in the upstream repo)
 - Exposed API protected by a required API key
 - Default CommandCode API key from config
 - Per-request CommandCode API key via `x-command-code-api-key` header
