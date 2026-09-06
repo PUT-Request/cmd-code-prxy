@@ -20,3 +20,7 @@ Thumbs.db
 /dist/
 *.exe
 *.zip
+
+# Runtime config (contains API keys)
+config.yaml
+command-code-proxy-server-linux-amd64

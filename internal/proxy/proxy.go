@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/dev2k6/command-code-proxy-server/internal/api"
+	"github.com/dev2k6/command-code-proxy-server/internal/config"
 	"github.com/dev2k6/command-code-proxy-server/internal/version"
 	"github.com/google/uuid"
 )
@@ -60,18 +61,20 @@ func normalizeFinishReason(reason string) string {
 
 // Proxy struct
 type Proxy struct {
-	APIKey  string
 	BaseURL string
 	Client  *http.Client
 	Debug   bool
+
+	// keyDefFn is called per-request to retrieve the matched APIKeyDef.
+	keyDefFn func(r *http.Request) *config.APIKeyDef
 }
 
-// NewProxy creates a new proxy instance
-func NewProxy(apiKey string) *Proxy {
+// NewProxy creates a new proxy instance.
+func NewProxy(keyDefFn func(r *http.Request) *config.APIKeyDef) *Proxy {
 	return &Proxy{
-		APIKey:  apiKey,
-		BaseURL: defaultBaseURL,
-		Client:  &http.Client{Timeout: defaultTimeout},
+		BaseURL:  defaultBaseURL,
+		Client:   &http.Client{Timeout: defaultTimeout},
+		keyDefFn: keyDefFn,
 	}
 }
 
@@ -126,7 +129,7 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 }
 
 // CreateUpstreamRequest creates a new HTTP request to the CommandCode API
-func (p *Proxy) CreateUpstreamRequest(ctx context.Context, ccBody api.CCRequestBody, apiKey string, bodyJSON []byte) (*http.Request, error) {
+func (p *Proxy) CreateUpstreamRequest(ctx context.Context, ccBody api.CCRequestBody, ccKey string, bodyJSON []byte) (*http.Request, error) {
 	ccReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		p.BaseURL+"/alpha/generate", bytes.NewReader(bodyJSON))
 	if err != nil {
@@ -134,7 +137,7 @@ func (p *Proxy) CreateUpstreamRequest(ctx context.Context, ccBody api.CCRequestB
 	}
 
 	ccReq.Header.Set("Content-Type", "application/json")
-	ccReq.Header.Set("Authorization", "Bearer "+apiKey)
+	ccReq.Header.Set("Authorization", "Bearer "+ccKey)
 	ccReq.Header.Set("x-command-code-version", version.GetCommandCodeVersion())
 	ccReq.Header.Set("x-cli-environment", "production")
 	ccReq.Header.Set("Accept", "text/event-stream")
@@ -151,6 +154,25 @@ func (p *Proxy) CallUpstream(req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
+// allowedModels checks whether the requested model is permitted for the given key.
+// Returns the canonical model name and nil error on success.
+func (p *Proxy) allowedModel(keyDef *config.APIKeyDef, requestedModel string) (string, error) {
+	canonical := MapModel(requestedModel)
+
+	if keyDef == nil || len(keyDef.Models) == 0 {
+		// No restriction.
+		return canonical, nil
+	}
+
+	for _, m := range keyDef.Models {
+		if strings.EqualFold(m, canonical) || strings.EqualFold(m, requestedModel) {
+			return canonical, nil
+		}
+	}
+
+	return "", fmt.Errorf("model %q is not allowed for this API key", requestedModel)
+}
+
 // HandleChatCompletions handles the /v1/chat/completions endpoint
 func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -158,16 +180,7 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get CommandCode API key from the optional x-command-code-api-key header
-	// or fall back to the server's configured default.
-	apiKey := strings.TrimSpace(r.Header.Get("x-command-code-api-key"))
-	if apiKey == "" {
-		apiKey = p.APIKey
-	}
-	if apiKey == "" {
-		p.writeOpenAIError(w, http.StatusUnauthorized, "CommandCode API key required. Set x-command-code-api-key header or configure api_key.", "authentication_error")
-		return
-	}
+	keyDef := p.keyDefFn(r)
 
 	// Read request
 	body, err := io.ReadAll(r.Body)
@@ -189,14 +202,21 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build CommandCode request
+	// Model allowlist check
+	canonicalModel, err := p.allowedModel(keyDef, openAIReq.Model)
+	if err != nil {
+		p.writeOpenAIError(w, http.StatusForbidden, err.Error(), "invalid_request_error")
+		return
+	}
+
+	// Build CommandCode request (uses canonical model name)
+	openAIReq.Model = canonicalModel
 	ccBody, err := p.BuildRequest(openAIReq)
 	if err != nil {
 		p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to build request", "server_error")
 		return
 	}
 
-	// Marshal request body once so we can retry on 503
 	reqJSON, err := json.Marshal(ccBody)
 	if err != nil {
 		p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to build request", "server_error")
@@ -204,25 +224,32 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	p.debugf("[DEBUG] CommandCode request body: %s", truncateLog(string(reqJSON)))
 
-	retryDelays := []time.Duration{0, 10 * time.Second, 20 * time.Second}
-	maxRetries := len(retryDelays)
+	// Determine upstream CC keys to try
+	ccKeys := p.ccKeys(keyDef)
+	if len(ccKeys) == 0 {
+		p.writeOpenAIError(w, http.StatusServiceUnavailable, "No upstream CommandCode keys configured for this API key.", "api_error")
+		return
+	}
+
+	// Retry / key-rotation loop.
+	// Tries each CC key in order. On 503 from upstream, advances to the next key
+	// with exponential-ish backoff. All keys exhausted → 503.
+	backoff := 10 * time.Second
 	var ccResp *http.Response
 
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		// Wait before retry (delay is 0 for the first attempt)
+	for attempt, ccKey := range ccKeys {
 		if attempt > 0 {
-			delay := retryDelays[attempt-1]
-			log.Printf("[RETRY] Attempt %d/%d after %v backoff", attempt+1, maxRetries+1, delay)
+			log.Printf("[RETRY] Rotating to CC key %d/%d after %v backoff", attempt+1, len(ccKeys), backoff)
 			select {
 			case <-r.Context().Done():
 				p.writeOpenAIError(w, http.StatusRequestTimeout, "Client disconnected during retry", "api_error")
 				return
-			case <-time.After(delay):
+			case <-time.After(backoff):
+				backoff *= 2 // exponential
 			}
 		}
 
-		// Create a fresh upstream request for each attempt
-		ccReq, err := p.CreateUpstreamRequest(r.Context(), ccBody, apiKey, reqJSON)
+		ccReq, err := p.CreateUpstreamRequest(r.Context(), ccBody, ccKey, reqJSON)
 		if err != nil {
 			p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to create upstream request", "server_error")
 			return
@@ -238,20 +265,22 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Success — proceed
 		if ccResp.StatusCode == http.StatusOK {
 			break
 		}
 
-		// 503 — retry if we have attempts left
-		if ccResp.StatusCode == http.StatusServiceUnavailable && attempt < maxRetries {
+		// 429 or 503 → rotate key
+		if (ccResp.StatusCode == http.StatusServiceUnavailable ||
+			ccResp.StatusCode == http.StatusTooManyRequests) &&
+			attempt < len(ccKeys)-1 {
 			errBody, _ := io.ReadAll(ccResp.Body)
 			ccResp.Body.Close()
-			log.Printf("[RETRY] Upstream returned 503 (attempt %d/%d): %s", attempt+1, maxRetries+1, string(errBody))
+			log.Printf("[RETRY] Upstream returned %d with CC key %d/%d: %s",
+				ccResp.StatusCode, attempt+1, len(ccKeys), string(errBody))
 			continue
 		}
 
-		// Non-retryable error — return immediately
+		// Non-retryable or last attempt — return error
 		errBody, _ := io.ReadAll(ccResp.Body)
 		ccResp.Body.Close()
 		message := fmt.Sprintf("Upstream error: %s", string(errBody))
@@ -273,6 +302,15 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	} else {
 		p.NonStreamResponse(w, ccResp, requestID, ccBody.Params.Model, created)
 	}
+}
+
+// ccKeys returns the list of upstream CC keys to try, from the per-key definition
+// or the legacy single-key field.
+func (p *Proxy) ccKeys(keyDef *config.APIKeyDef) []string {
+	if keyDef != nil && len(keyDef.CommandCodeKeys) > 0 {
+		return keyDef.CommandCodeKeys
+	}
+	return nil
 }
 
 // StreamResponse handles streaming response from CommandCode to OpenAI SSE
@@ -729,39 +767,59 @@ func responseItemsToMessages(items []any) []api.OpenAIMessage {
 	return messages
 }
 
-// HandleModels handles the /v1/models endpoint
+// HandleModels handles the /v1/models endpoint.
+// Returns only the models permitted for the requesting API key.
 func (p *Proxy) HandleModels(w http.ResponseWriter, r *http.Request) {
+	keyDef := p.keyDefFn(r)
+
+	allModels := []api.OpenAIModel{
+		// MoonshotAI
+		{ID: "moonshotai/Kimi-K2.6", Object: "model", Created: 0, OwnedBy: "moonshotai"},
+		{ID: "moonshotai/Kimi-K2.5", Object: "model", Created: 0, OwnedBy: "moonshotai"},
+		// ZhipuAI
+		{ID: "zai-org/GLM-5.1", Object: "model", Created: 0, OwnedBy: "zhipuai"},
+		{ID: "zai-org/GLM-5", Object: "model", Created: 0, OwnedBy: "zhipuai"},
+		// MiniMaxAI
+		{ID: "MiniMaxAI/MiniMax-M2.7", Object: "model", Created: 0, OwnedBy: "minimaxai"},
+		{ID: "MiniMaxAI/MiniMax-M2.5", Object: "model", Created: 0, OwnedBy: "minimaxai"},
+		{ID: "MiniMaxAI/MiniMax-M3", Object: "model", Created: 0, OwnedBy: "minimaxai"},
+		// DeepSeek
+		{ID: "deepseek/deepseek-v4-pro", Object: "model", Created: 0, OwnedBy: "deepseek"},
+		{ID: "deepseek/deepseek-v4-flash", Object: "model", Created: 0, OwnedBy: "deepseek"},
+		// Qwen
+		{ID: "Qwen/Qwen3.6-Max-Preview", Object: "model", Created: 0, OwnedBy: "qwen"},
+		{ID: "Qwen/Qwen3.6-Plus", Object: "model", Created: 0, OwnedBy: "qwen"},
+		// StepFun
+		{ID: "stepfun/Step-3.5-Flash", Object: "model", Created: 0, OwnedBy: "stepfun"},
+		{ID: "stepfun/Step-3.7-Flash", Object: "model", Created: 0, OwnedBy: "stepfun"},
+		// Qwen (3.7 line)
+		{ID: "Qwen/Qwen3.7-Max-Free", Object: "model", Created: 0, OwnedBy: "qwen"},
+		{ID: "Qwen/Qwen3.7-Max", Object: "model", Created: 0, OwnedBy: "qwen"},
+		// Xiaomi MiMo
+		{ID: "xiaomi/mimo-v2.5-pro", Object: "model", Created: 0, OwnedBy: "xiaomi"},
+		{ID: "xiaomi/mimo-v2.5", Object: "model", Created: 0, OwnedBy: "xiaomi"},
+		// Google
+		{ID: "google/gemini-3.1-flash-lite", Object: "model", Created: 0, OwnedBy: "google"},
+	}
+
+	// Filter by allowed models if the key has a restriction
+	if keyDef != nil && len(keyDef.Models) > 0 {
+		allowed := make(map[string]bool, len(keyDef.Models))
+		for _, m := range keyDef.Models {
+			allowed[strings.ToLower(m)] = true
+		}
+		filtered := make([]api.OpenAIModel, 0, len(allowed))
+		for _, m := range allModels {
+			if allowed[strings.ToLower(m.ID)] {
+				filtered = append(filtered, m)
+			}
+		}
+		allModels = filtered
+	}
+
 	models := api.OpenAIModelList{
 		Object: "list",
-		Data: []api.OpenAIModel{
-			// MoonshotAI
-			{ID: "moonshotai/Kimi-K2.6", Object: "model", Created: 0, OwnedBy: "moonshotai"},
-			{ID: "moonshotai/Kimi-K2.5", Object: "model", Created: 0, OwnedBy: "moonshotai"},
-			// ZhipuAI
-			{ID: "zai-org/GLM-5.1", Object: "model", Created: 0, OwnedBy: "zhipuai"},
-			{ID: "zai-org/GLM-5", Object: "model", Created: 0, OwnedBy: "zhipuai"},
-			// MiniMaxAI
-			{ID: "MiniMaxAI/MiniMax-M2.7", Object: "model", Created: 0, OwnedBy: "minimaxai"},
-			{ID: "MiniMaxAI/MiniMax-M2.5", Object: "model", Created: 0, OwnedBy: "minimaxai"},
-			{ID: "MiniMaxAI/MiniMax-M3", Object: "model", Created: 0, OwnedBy: "minimaxai"},
-			// DeepSeek
-			{ID: "deepseek/deepseek-v4-pro", Object: "model", Created: 0, OwnedBy: "deepseek"},
-			{ID: "deepseek/deepseek-v4-flash", Object: "model", Created: 0, OwnedBy: "deepseek"},
-			// Qwen
-			{ID: "Qwen/Qwen3.6-Max-Preview", Object: "model", Created: 0, OwnedBy: "qwen"},
-			{ID: "Qwen/Qwen3.6-Plus", Object: "model", Created: 0, OwnedBy: "qwen"},
-			// StepFun
-			{ID: "stepfun/Step-3.5-Flash", Object: "model", Created: 0, OwnedBy: "stepfun"},
-			{ID: "stepfun/Step-3.7-Flash", Object: "model", Created: 0, OwnedBy: "stepfun"},
-			// Qwen (3.7 line)
-			{ID: "Qwen/Qwen3.7-Max-Free", Object: "model", Created: 0, OwnedBy: "qwen"},
-			{ID: "Qwen/Qwen3.7-Max", Object: "model", Created: 0, OwnedBy: "qwen"},
-			// Xiaomi MiMo
-			{ID: "xiaomi/mimo-v2.5-pro", Object: "model", Created: 0, OwnedBy: "xiaomi"},
-			{ID: "xiaomi/mimo-v2.5", Object: "model", Created: 0, OwnedBy: "xiaomi"},
-			// Google
-			{ID: "google/gemini-3.1-flash-lite", Object: "model", Created: 0, OwnedBy: "google"},
-		},
+		Data:   allModels,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(models)

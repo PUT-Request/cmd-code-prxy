@@ -1,80 +1,99 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/dev2k6/command-code-proxy-server/internal/config"
 	"github.com/dev2k6/command-code-proxy-server/internal/proxy"
 )
 
 const defaultPort = "55990"
 const defaultHost = "127.0.0.1"
 
-// Server represents the HTTP server
-type Server struct {
-	Port         string
-	Host         string
-	Proxy        *proxy.Proxy
-	Handler      http.Handler
-	ServerAPIKey string
+type contextKey string
+
+const apiKeyDefContextKey contextKey = "api_key_def"
+
+// GetAPIKeyDef retrieves the matched APIKeyDef from the request context.
+// Returns nil if no key was matched (should not happen after auth middleware).
+func GetAPIKeyDef(r *http.Request) *config.APIKeyDef {
+	v, _ := r.Context().Value(apiKeyDefContextKey).(*config.APIKeyDef)
+	return v
 }
 
-// NewServer creates a new server instance
-func NewServer(proxy *proxy.Proxy) *Server {
+// Server represents the HTTP server
+type Server struct {
+	Port    string
+	Host    string
+	Proxy   *proxy.Proxy
+	Handler http.Handler
+}
+
+// NewServer creates a new server instance with auth and routing wired up.
+func NewServer(keyMap map[string]*config.APIKeyDef, p *proxy.Proxy) *Server {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/chat/completions", logger(proxy.HandleChatCompletions))
-	mux.HandleFunc("/chat/completions", logger(proxy.HandleChatCompletions))
-	mux.HandleFunc("/v1/responses", logger(proxy.HandleResponses))
-	mux.HandleFunc("/v1/models", logger(proxy.HandleModels))
+	mux.HandleFunc("/v1/chat/completions", logger(p.HandleChatCompletions))
+	mux.HandleFunc("/chat/completions", logger(p.HandleChatCompletions))
+	mux.HandleFunc("/v1/responses", logger(p.HandleResponses))
+	mux.HandleFunc("/v1/models", logger(p.HandleModels))
 	mux.HandleFunc("/health", logger(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"ok"}`))
 	}))
 
-	return &Server{
+	s := &Server{
 		Port:    defaultPort,
 		Host:    defaultHost,
-		Proxy:   proxy,
-		Handler: mux,
+		Proxy:   p,
+		Handler: withAuth(keyMap, mux),
 	}
+	return s
 }
 
-// SetServerAPIKey sets the API key required to access the exposed API.
-// Endpoints (except /health) reject requests without this key.
-func (s *Server) SetServerAPIKey(key string) {
-	s.ServerAPIKey = key
-	s.Handler = withAuth(s.ServerAPIKey, s.Handler)
-}
-
-// withAuth wraps the handler with API key authentication for all endpoints
-// except /health, which is kept open for health checks.
-func withAuth(apiKey string, next http.Handler) http.Handler {
+// withAuth wraps the handler with API key authentication.
+// Health endpoint is exempt. On success the matched APIKeyDef is injected
+// into the request context for downstream use.
+func withAuth(keyMap map[string]*config.APIKeyDef, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/health" {
 			next.ServeHTTP(w, r)
 			return
 		}
 
-		auth := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		auth = strings.TrimSpace(auth)
-		if auth == "" || apiKey == "" || auth != apiKey {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"error": map[string]any{
-					"message": "Invalid or missing API key. Provide a valid key via the Authorization header.",
-					"type":    "authentication_error",
-					"param":   nil,
-					"code":    nil,
-				},
-			})
+		raw := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		raw = strings.TrimSpace(raw)
+
+		if raw == "" || keyMap == nil {
+			rejectAuth(w)
 			return
 		}
 
-		next.ServeHTTP(w, r)
+		def, ok := keyMap[raw]
+		if !ok {
+			rejectAuth(w)
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), apiKeyDefContextKey, def)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func rejectAuth(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]any{
+			"message": "Invalid or missing API key. Provide a valid key via the Authorization header.",
+			"type":    "authentication_error",
+			"param":   nil,
+			"code":    nil,
+		},
 	})
 }
 
