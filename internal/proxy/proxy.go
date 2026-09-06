@@ -327,7 +327,7 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 	w.WriteHeader(http.StatusOK)
 
 	scanner := bufio.NewScanner(ccResp.Body)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), 30*1024*1024)
 	sentRole := false
 	toolCallIndex := 0
 	toolCallIndexes := map[string]int{}
@@ -532,7 +532,7 @@ func (p *Proxy) WriteSSE(w io.Writer, flusher http.Flusher, resp api.OpenAIChatR
 // NonStreamResponse handles non-streaming response
 func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, requestID, model string, created int64) {
 	scanner := bufio.NewScanner(ccResp.Body)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	scanner.Buffer(make([]byte, 64*1024), 30*1024*1024)
 
 	var content strings.Builder
 	var reasoningContent strings.Builder
