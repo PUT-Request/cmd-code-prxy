@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Keys</title>
+  <link rel="stylesheet" href="/dashboard/static/pico.min.css">
+  <link rel="stylesheet" href="/dashboard/static/dash.css">
+</head>
+<body>
+  <header class="container">
+    <nav>
+    <ul>
+      <li><a href="/dashboard/">Usage</a></li>
+      <li><a href="/dashboard/keys" aria-current="page">Keys</a></li>
+      <li><a href="/dashboard/logout">Sign out</a></li>
+    </ul>
+    </nav>
+  </header>
+
+  <main class="container">
+    <article>
+      <header><strong>API keys</strong></header>
+      <table class="striped">
+        <thead>
+          <tr>
+            <th scope="col">Key</th>
+            <th scope="col">Models</th>
+            <th scope="col">Rate limit</th>
+            <th scope="col">Upstream</th>
+            <th scope="col"></th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <footer>
+        <button id="add" class="secondary" type="button">Add key</button>
+      </footer>
+    </article>
+
+    <dialog id="editor">
+      <!-- No method="dialog": that makes Enter in any field close the dialog
+           and silently discard the edit. Submit is intercepted instead. -->
+      <form id="form">
+        <article>
+          <header><strong id="title">Add key</strong></header>
+          <fieldset>
+            <label for="fKey">
+              Key
+              <input type="text" id="fKey" name="key" required autocomplete="off" spellcheck="false">
+            </label>
+            <label for="fModels">
+              Models (comma separated, empty = all)
+              <input type="text" id="fModels" name="models" autocomplete="off" spellcheck="false">
+            </label>
+            <label for="fUpstream">
+              Upstream keys (one per line; leave a masked value to keep it)
+              <textarea id="fUpstream" name="upstream" rows="4" autocomplete="off" spellcheck="false"></textarea>
+            </label>
+            <label for="fRate">
+              Rate limit
+              <input type="number" id="fRate" name="rate_limit" min="0" value="0">
+            </label>
+          </fieldset>
+          <p id="err" hidden><mark></mark></p>
+          <footer>
+            <button id="cancel" class="secondary outline" type="button">Cancel</button>
+            <button id="save" type="submit">Save</button>
+          </footer>
+        </article>
+      </form>
+    </dialog>
+  </main>
+
+  <script>
+    let keys = [];
+    let editIndex = null;
+    const dialog = document.getElementById('editor');
+    const errP = document.getElementById('err');
+    const err = errP.querySelector('mark');
+
+    function showError(msg) {
+      err.textContent = msg;
+      errP.hidden = !msg;
+    }
+
+    function cell(text) {
+      const td = document.createElement('td');
+      td.textContent = text;
+      return td;
+    }
+
+    async function load() {
+      const res = await fetch('/dashboard/api/keys');
+      if (res.status === 401) {
+        location.href = '/dashboard/login';
+        return;
+      }
+      const data = await res.json();
+      keys = data;
+      render();
+    }
+
+    function render() {
+      const tbody = document.getElementById('rows');
+      tbody.innerHTML = '';
+      if (!keys.length) {
+        const tr = document.createElement('tr');
+        const td = cell('No keys');
+        td.colSpan = 5;
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+      }
+      keys.forEach((k, i) => {
+        const tr = document.createElement('tr');
+        tr.appendChild(cell(k.masked_key));
+        tr.appendChild(cell(k.models.length ? k.models.join(', ') : 'all'));
+        tr.appendChild(cell(k.rate_limit || '—'));
+        tr.appendChild(cell(String(k.upstream_count)));
+
+        const actions = document.createElement('td');
+        const edit = document.createElement('button');
+        edit.className = 'secondary outline';
+        edit.type = 'button';
+        edit.textContent = 'Edit';
+        edit.addEventListener('click', () => open(i));
+        const del = document.createElement('button');
+        del.className = 'secondary outline';
+        del.type = 'button';
+        del.textContent = 'Delete';
+        del.addEventListener('click', () => remove(i));
+        actions.append(edit, del);
+        tr.appendChild(actions);
+        tbody.appendChild(tr);
+      });
+    }
+
+    function open(i) {
+      editIndex = i;
+      showError('');
+      if (i === null) {
+        document.getElementById('title').textContent = 'Add key';
+        document.getElementById('fKey').value = '';
+        document.getElementById('fModels').value = '';
+        document.getElementById('fUpstream').value = '';
+        document.getElementById('fRate').value = 0;
+      } else {
+        const k = keys[i];
+        document.getElementById('title').textContent = 'Edit key';
+        document.getElementById('fKey').value = k.masked_key;
+        document.getElementById('fModels').value = (k.models || []).join(', ');
+        // Masked values are submitted back to mean "unchanged".
+        document.getElementById('fUpstream').value = (k.upstream || []).join('\n');
+        document.getElementById('fRate').value = k.rate_limit || 0;
+      }
+      dialog.showModal();
+    }
+
+    async function save() {
+      const upstream = document
+        .getElementById('fUpstream').value
+        .split('\n').map(s => s.trim()).filter(Boolean);
+      const models = document
+        .getElementById('fModels').value
+        .split(',').map(s => s.trim()).filter(Boolean);
+
+      const body = {
+        index: editIndex,
+        key: document.getElementById('fKey').value.trim(),
+        models: models,
+        command_code_keys: upstream,
+        rate_limit: Number(document.getElementById('fRate').value) || 0,
+      };
+
+      const res = await fetch('/dashboard/api/keys/save', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        showError(data.error || 'save failed');
+        return;
+      }
+      keys = data.keys;
+      render();
+      dialog.close();
+    }
+
+    async function remove(i) {
+      if (!confirm('Delete this key?')) return;
+      const res = await fetch('/dashboard/api/keys/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ index: i }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || 'delete failed');
+        return;
+      }
+      keys = data.keys;
+      render();
+    }
+
+    document.getElementById('add').addEventListener('click', () => open(null));
+    // Enter submits the form; saving through the same path keeps behaviour
+    // identical either way.
+    document.getElementById('form').addEventListener('submit', (e) => {
+      e.preventDefault();
+      save();
+    });
+    document.getElementById('cancel').addEventListener('click', () => dialog.close());
+    load();
+  </script>
+</body>
+</html>

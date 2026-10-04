@@ -35,6 +35,43 @@ Default server address:
 http://127.0.0.1:55990
 ```
 
+## Dashboard
+
+Optional management UI at `/dashboard/`. Enable it in `config.yaml`:
+
+```yaml
+dashboard:
+  enabled: true
+  username: "admin"
+  password: "change-me"
+  session_hours: 24
+```
+
+Sign in with those credentials. The dashboard shows token usage (24h / 7d / 30d)
+broken down by account and by model, and manages `api_keys` in `config.yaml`
+(add, edit, delete). Edits apply immediately — no restart needed.
+
+Existing key values are never sent to the browser: the UI shows a masked
+fingerprint (`****abcd`), and submitting that mask back means "unchanged". Only
+newly typed keys are stored, so secrets cannot be read back through the UI.
+
+Usage is kept in memory and resets on restart. `CC_MAX_TOOL_IMAGE_MB` (see
+Image input) applies here too.
+
+The dashboard listens on the same host and port as the API by default. Two
+optional settings:
+
+```yaml
+dashboard:
+  # Serve only on this port, leaving the API port untouched.
+  port: "57399"
+```
+
+Set `CC_DASHBOARD_SECURE_COOKIE=1` when the panel is served over HTTPS. Leave it
+unset for plain HTTP: a `Secure` cookie is silently dropped by browsers over
+`http://`, which makes login appear to succeed but bounce straight back to the
+login page.
+
 ## Configuration
 
 The server reads a `config.yaml` file from the current directory (override with `-config`). Example:
@@ -184,6 +221,60 @@ curl -N http://127.0.0.1:55990/v1/chat/completions \
     "stream": true
   }'
 ```
+
+### Image input
+
+Images are forwarded as real multimodal parts, not text. Use `image_url` content
+blocks with a base64 data URL (`http` URLs cannot be fetched upstream and are
+replaced with a text reference):
+
+```bash
+curl http://127.0.0.1:55990/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-server-api-key" \
+  -d '{
+    "model": "deepseek-v4-pro",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "What is in this screenshot?"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}}
+      ]
+    }]
+  }'
+```
+
+Images returned inside **tool results** are hoisted into a following `user`
+message instead of being inlined as text. This matters: base64 tokenized as
+prose costs roughly 700 tokens per MB, so a single 2.76 MB screenshot would
+consume ~1.9M tokens and immediately exceed the 1M context window.
+
+`CC_MAX_TOOL_IMAGE_MB` caps the total tool-image bytes sent per request
+(default `6`, `0` disables trimming). Older images beyond the budget are
+replaced with a placeholder so the model knows a screenshot was dropped.
+
+### Reasoning effort
+
+`reasoning_effort` selects thinking intensity. Accepted values: `minimal`,
+`low`, `medium`, `high`, `max`. Unsupported values are ignored (logged, not
+fatal) so the upstream default applies.
+
+```bash
+curl http://127.0.0.1:55990/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-server-api-key" \
+  -d '{
+    "model": "deepseek-v4-pro",
+    "messages": [{"role": "user", "content": "Plan the refactor."}],
+    "reasoning_effort": "high"
+  }'
+```
+
+On `/v1/responses`, use the Responses shape instead: `"reasoning": {"effort": "high"}`.
+
+When a client replays assistant history, `reasoning_content` must be echoed back
+(it is emitted as a leading `reasoning` block). The upstream validates the
+thinking round-trip and rejects requests whose reasoning is missing.
 
 ## Supported model aliases
 

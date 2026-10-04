@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dev2k6/command-code-proxy-server/internal/config"
@@ -32,10 +33,39 @@ type Server struct {
 	Host    string
 	Proxy   *proxy.Proxy
 	Handler http.Handler
+
+	// keyMu guards keyMap so dashboard edits can swap it at runtime.
+	keyMu  sync.RWMutex
+	keyMap map[string]*config.APIKeyDef
+}
+
+// SetKeys replaces the live API key map. Called by the dashboard after it
+// persists a change, so key edits apply without a restart.
+func (s *Server) SetKeys(defs []config.APIKeyDef) {
+	m := make(map[string]*config.APIKeyDef, len(defs))
+	for i := range defs {
+		d := defs[i]
+		if d.Key == "" {
+			continue
+		}
+		m[d.Key] = &d
+	}
+	s.keyMu.Lock()
+	s.keyMap = m
+	s.keyMu.Unlock()
+}
+
+func (s *Server) lookup(key string) (*config.APIKeyDef, bool) {
+	s.keyMu.RLock()
+	defer s.keyMu.RUnlock()
+	def, ok := s.keyMap[key]
+	return def, ok
 }
 
 // NewServer creates a new server instance with auth and routing wired up.
-func NewServer(keyMap map[string]*config.APIKeyDef, p *proxy.Proxy) *Server {
+// mount, when non-nil, registers additional routes (the dashboard) on the same
+// mux before auth is applied, so it manages its own access control.
+func NewServer(keyMap map[string]*config.APIKeyDef, p *proxy.Proxy, mount ...func(*http.ServeMux)) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/chat/completions", logger(p.HandleChatCompletions))
 	mux.HandleFunc("/chat/completions", logger(p.HandleChatCompletions))
@@ -46,21 +76,30 @@ func NewServer(keyMap map[string]*config.APIKeyDef, p *proxy.Proxy) *Server {
 		w.Write([]byte(`{"status":"ok"}`))
 	}))
 
+	for _, fn := range mount {
+		if fn != nil {
+			fn(mux)
+		}
+	}
+
 	s := &Server{
 		Port:    defaultPort,
 		Host:    defaultHost,
 		Proxy:   p,
-		Handler: withAuth(keyMap, mux),
+		keyMap:  keyMap,
+		Handler: nil,
 	}
+	s.Handler = withAuth(s, mux)
 	return s
 }
 
 // withAuth wraps the handler with API key authentication.
-// Health endpoint is exempt. On success the matched APIKeyDef is injected
-// into the request context for downstream use.
-func withAuth(keyMap map[string]*config.APIKeyDef, next http.Handler) http.Handler {
+// Health is exempt. Dashboard routes are exempt because they carry their own
+// username/password session and must never accept an API key.
+// On success the matched APIKeyDef is injected into the request context.
+func withAuth(s *Server, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/health" {
+		if isExemptPath(r.URL.Path) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -68,12 +107,12 @@ func withAuth(keyMap map[string]*config.APIKeyDef, next http.Handler) http.Handl
 		raw := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		raw = strings.TrimSpace(raw)
 
-		if raw == "" || keyMap == nil {
+		if raw == "" {
 			rejectAuth(w)
 			return
 		}
 
-		def, ok := keyMap[raw]
+		def, ok := s.lookup(raw)
 		if !ok {
 			rejectAuth(w)
 			return
@@ -82,6 +121,14 @@ func withAuth(keyMap map[string]*config.APIKeyDef, next http.Handler) http.Handl
 		ctx := context.WithValue(r.Context(), apiKeyDefContextKey, def)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// dashboardPrefix is guarded by its own username/password session, so API key
+// auth must not apply to it.
+const dashboardPrefix = "/dashboard/"
+
+func isExemptPath(path string) bool {
+	return path == "/health" || strings.HasPrefix(path, dashboardPrefix)
 }
 
 func rejectAuth(w http.ResponseWriter) {

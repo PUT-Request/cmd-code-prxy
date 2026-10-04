@@ -9,18 +9,34 @@ import (
 
 // APIKeyDef defines a client API key with model restrictions and upstream key pool.
 type APIKeyDef struct {
-	Key              string   `yaml:"key"`
-	Models           []string `yaml:"models"`
-	CommandCodeKeys  []string `yaml:"command_code_keys"`
-	RateLimit        int      `yaml:"rate_limit"`
+	Key             string   `yaml:"key"`
+	Models          []string `yaml:"models"`
+	CommandCodeKeys []string `yaml:"command_code_keys"`
+	RateLimit       int      `yaml:"rate_limit"`
+}
+
+// DashboardConfig controls the management UI.
+type DashboardConfig struct {
+	Enabled      bool   `yaml:"enabled"`
+	Username     string `yaml:"username"`
+	Password     string `yaml:"password"`
+	SessionHours int    `yaml:"session_hours"`
+	// Port serves the dashboard on its own listener instead of the API port.
+	// Zero shares the API listener. A separate port lets you expose only the
+	// panel, or keep the API on its existing port.
+	Port string `yaml:"port"`
 }
 
 // Config holds all runtime configuration for the proxy server.
 type Config struct {
-	Host         string       `yaml:"host"`
-	Port         string       `yaml:"port"`
-	APIKeys      []APIKeyDef  `yaml:"api_keys"`
-	Debug        bool         `yaml:"debug"`
+	Host      string          `yaml:"host"`
+	Port      string          `yaml:"port"`
+	APIKeys   []APIKeyDef     `yaml:"api_keys"`
+	Debug     bool            `yaml:"debug"`
+	Dashboard DashboardConfig `yaml:"dashboard"`
+
+	// BaseURL overrides the CommandCode API endpoint. Empty uses the default.
+	BaseURL string `yaml:"base_url"`
 
 	// Deprecated: kept for backward compatibility. Migrated to APIKeys.
 	APIKey       string `yaml:"api_key"`

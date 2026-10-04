@@ -1,0 +1,29 @@
+/* Companion stylesheet for the dashboard. Pico handles everything else; this
+ * file only covers the cases Pico has no built-in for. */
+
+/* Pico v2 defaults to a 100% root font size, which renders oversized on
+ * desktop. This is Pico's own documented scale knob — every spacing, type,
+ * and component size derives from it, so one line resizes the whole UI. */
+:root {
+  --pico-font-size: 87.5%;
+}
+
+/* Chart.js runs with responsive + maintainAspectRatio:false, which sizes the
+ * canvas to its parent. Without a fixed height here the canvas and the
+ * surrounding article feed each other on every update and the chart grows
+ * without bound (worse with the 15s refresh). A fixed box stops that. */
+.chart-box {
+  position: relative;
+  height: 320px;
+}
+
+@media (max-width: 768px) {
+  .chart-box {
+    height: 240px;
+  }
+}
+
+/* The keys dialog error line must not render as an empty pill when idle. */
+#err[hidden] {
+  display: none;
+}

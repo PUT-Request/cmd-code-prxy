@@ -18,6 +18,15 @@ type CCContentPart struct {
 	Output     *CCToolOutput `json:"output,omitempty"`
 	ToolUseID  *string       `json:"tool_use_id,omitempty"`
 	Content    any           `json:"content,omitempty"`
+
+	// Image carries the image payload for type:"image" parts. The CC wire
+	// format wants the full data URL verbatim:
+	//   { type: "image", image: "data:image/png;base64,...", mimeType: "image/png" }
+	// Never inline base64 into Text instead — the upstream tokenizer treats it
+	// as prose, and a single 2.76MB screenshot costs ~1.92M tokens, which blows
+	// through the 1M context window outright.
+	Image    *string `json:"image,omitempty"`
+	MimeType *string `json:"mimeType,omitempty"`
 }
 
 type CCMessage struct {
@@ -33,6 +42,11 @@ type CCChatParams struct {
 	MaxTokens   int         `json:"max_tokens"`
 	Temperature float64     `json:"temperature"`
 	Stream      bool        `json:"stream"`
+
+	// ReasoningEffort controls thinking intensity: minimal|low|medium|high|max.
+	// Omitted (empty) when the client did not ask for a specific level, so the
+	// upstream default applies.
+	ReasoningEffort string `json:"reasoning_effort,omitempty"`
 }
 
 type CCConfig struct {

@@ -12,7 +12,6 @@ type OpenAIMessage struct {
 	Audio            *MessageAudio `json:"audio,omitempty"`
 	ReasoningContent *string       `json:"reasoning_content,omitempty"`
 }
-
 type ContentPart struct {
 	Type     string    `json:"type"`
 	Text     string    `json:"text,omitempty"`
@@ -59,6 +58,14 @@ type OpenAIChatRequest struct {
 	PresencePenalty     *float64        `json:"presence_penalty,omitempty"`
 	FrequencyPenalty    *float64        `json:"frequency_penalty,omitempty"`
 	User                string          `json:"user,omitempty"`
+
+	// ReasoningEffort selects thinking intensity: minimal|low|medium|high|max.
+	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
+}
+
+// ResponsesAPIReasoning is the OpenAI Responses API reasoning object.
+type ResponsesAPIReasoning struct {
+	Effort string `json:"effort,omitempty"`
 }
 
 type OpenAIResponsesRequest struct {
@@ -77,6 +84,9 @@ type OpenAIResponsesRequest struct {
 	Stop                any      `json:"stop,omitempty"`
 	TopP                *float64 `json:"top_p,omitempty"`
 	User                string   `json:"user,omitempty"`
+
+	// Reasoning carries the Responses API effort knob (reasoning.effort).
+	Reasoning *ResponsesAPIReasoning `json:"reasoning,omitempty"`
 }
 
 type OpenAIChoice struct {

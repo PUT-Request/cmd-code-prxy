@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Usage</title>
+  <link rel="stylesheet" href="/dashboard/static/pico.min.css">
+  <link rel="stylesheet" href="/dashboard/static/dash.css">
+</head>
+<body>
+  <header class="container">
+    <nav>
+    <ul>
+      <li><a href="/dashboard/" aria-current="page">Usage</a></li>
+      <li><a href="/dashboard/keys">Keys</a></li>
+      <li><a href="/dashboard/logout">Sign out</a></li>
+    </ul>
+    </nav>
+  </header>
+
+  <main class="container">
+    <!-- Range selector. Pico has no segmented control, and its joined-group
+         styles only join buttons — radios render as floating dots instead.
+         Real buttons get the joined-group treatment for free. -->
+    <div role="group">
+      <button type="button" id="r24" data-range="24h">24h</button>
+      <button type="button" id="r7" data-range="7d" class="secondary outline">7d</button>
+      <button type="button" id="r30" data-range="30d" class="secondary outline">30d</button>
+    </div>
+
+    <div class="grid">
+      <article>
+        <header><small>Total tokens</small></header>
+        <div><strong id="kTotal">0</strong></div>
+      </article>
+      <article>
+        <header><small>Input tokens</small></header>
+        <div><strong id="kInput">0</strong></div>
+      </article>
+      <article>
+        <header><small>Output tokens</small></header>
+        <div><strong id="kOutput">0</strong></div>
+      </article>
+      <article>
+        <header><small>Requests</small></header>
+        <div><strong id="kReqs">0</strong></div>
+      </article>
+    </div>
+
+    <article>
+      <header><strong>Tokens over time</strong></header>
+      <div class="chart-box">
+        <canvas id="chart"></canvas>
+      </div>
+    </article>
+
+    <article>
+      <header><strong>By account</strong></header>
+      <table class="striped">
+        <thead>
+          <tr>
+            <th scope="col">Account</th>
+            <th scope="col">Requests</th>
+            <th scope="col">Input</th>
+            <th scope="col">Output</th>
+            <th scope="col">Total</th>
+          </tr>
+        </thead>
+        <tbody id="byKey"></tbody>
+      </table>
+    </article>
+
+    <article>
+      <header><strong>By model</strong></header>
+      <table class="striped">
+        <thead>
+          <tr>
+            <th scope="col">Model</th>
+            <th scope="col">Requests</th>
+            <th scope="col">Input</th>
+            <th scope="col">Output</th>
+            <th scope="col">Total</th>
+          </tr>
+        </thead>
+        <tbody id="byModel"></tbody>
+      </table>
+    </article>
+  </main>
+
+  <script src="/dashboard/static/chart.umd.js"></script>
+  <script>
+    const nf = new Intl.NumberFormat();
+    const num = v => nf.format(v || 0);
+
+    let chart = null;
+
+    let range = '24h';
+
+    function setRangeButtons() {
+      for (const btn of document.querySelectorAll('div[role=group] button')) {
+        if (btn.dataset.range === range) {
+          btn.classList.remove('secondary', 'outline');
+        } else {
+          btn.classList.add('secondary', 'outline');
+        }
+      }
+    }
+
+    function renderTable(tbodyId, rows, labelKey) {
+      const tbody = document.getElementById(tbodyId);
+      tbody.innerHTML = '';
+      if (!rows.length) {
+        const tr = document.createElement('tr');
+        const td = document.createElement('td');
+        td.colSpan = 5;
+        td.textContent = 'No requests in this range';
+        tr.appendChild(td);
+        tbody.appendChild(tr);
+        return;
+      }
+      for (const r of rows) {
+        const tr = document.createElement('tr');
+        const cells = [
+          r[labelKey] || '—',
+          num(r.totals.requests),
+          num(r.totals.input_tokens),
+          num(r.totals.output_tokens),
+          num(r.totals.total_tokens),
+        ];
+        for (const c of cells) {
+          const td = document.createElement('td');
+          td.textContent = c;
+          tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+      }
+    }
+
+    function render(data) {
+      document.getElementById('kTotal').textContent = num(data.totals.total_tokens);
+      document.getElementById('kInput').textContent = num(data.totals.input_tokens);
+      document.getElementById('kOutput').textContent = num(data.totals.output_tokens);
+      document.getElementById('kReqs').textContent = num(data.totals.requests);
+
+      renderTable('byKey', data.by_key, 'key');
+      renderTable('byModel', data.by_model, 'key');
+
+      const labels = data.buckets.map(b => b.label);
+      const payload = {
+        labels: labels,
+        datasets: [
+          {
+            label: 'Input',
+            data: data.buckets.map(b => b.input_tokens),
+            backgroundColor: '#3b82f6',
+            borderColor: '#3b82f6',
+          },
+          {
+            label: 'Output',
+            data: data.buckets.map(b => b.output_tokens),
+            backgroundColor: '#10b981',
+            borderColor: '#10b981',
+          },
+        ],
+      };
+
+      if (chart) {
+        chart.data = payload;
+        chart.update();
+        return;
+      }
+      chart = new Chart(document.getElementById('chart'), {
+        type: 'bar',
+        data: payload,
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: { x: { stacked: true }, y: { stacked: true, beginAtZero: true } },
+          plugins: { legend: { display: true } },
+        },
+      });
+    }
+
+    async function load() {
+      const res = await fetch('/dashboard/api/usage?range=' + range);
+      if (res.status === 401) {
+        location.href = '/dashboard/login';
+        return;
+      }
+      render(await res.json());
+    }
+
+    for (const btn of document.querySelectorAll('div[role=group] button')) {
+      btn.addEventListener('click', () => {
+        range = btn.dataset.range;
+        setRangeButtons();
+        load();
+      });
+    }
+    setRangeButtons();
+    load();
+    setInterval(load, 15000);
+  </script>
+</body>
+</html>

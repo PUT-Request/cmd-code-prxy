@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in</title>
+  <link rel="stylesheet" href="/dashboard/static/pico.min.css">
+  <link rel="stylesheet" href="/dashboard/static/dash.css">
+</head>
+<body>
+  <main class="container">
+    <article>
+      <header><strong>Sign in</strong></header>
+      <form method="post" action="/dashboard/login">
+        <fieldset>
+          <label for="username">
+            Username
+            <input type="text" id="username" name="username" autocomplete="username" required>
+          </label>
+          <label for="password">
+            Password
+            <input type="password" id="password" name="password" autocomplete="current-password" required>
+          </label>
+        </fieldset>
+        {{if .}}<p><mark>{{.}}</mark></p>{{end}}
+        <button type="submit">Sign in</button>
+      </form>
+    </article>
+  </main>
+</body>
+</html>
