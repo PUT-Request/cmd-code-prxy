@@ -60,8 +60,11 @@ Existing key values are never sent to the browser: the UI shows a masked
 fingerprint (`****abcd`), and submitting that mask back means "unchanged". Only
 newly typed keys are stored, so secrets cannot be read back through the UI.
 
-Usage is kept in memory and resets on restart. `CC_MAX_TOOL_IMAGE_MB` (see
-Image input) applies here too.
+Usage is kept in memory and shown for 24h / 7d / 30d. Set
+`db_path` (e.g. `usage.db`) to persist it to a SQLite database
+(pure Go, no cgo); events are kept for 30 days. Without it, usage
+resets on restart. `CC_MAX_TOOL_IMAGE_MB` (see Image input)
+applies here too.
 
 The dashboard listens on the same host and port as the API by default. Two
 optional settings:
@@ -112,6 +115,7 @@ api_keys:
 #   username: "admin"
 #   password: "change-me"
 #   session_hours: 24
+#   db_path: "usage.db"   # SQLite file for token usage; empty = memory only
 
 # Enable verbose debug logging of request/response bodies.
 debug: false

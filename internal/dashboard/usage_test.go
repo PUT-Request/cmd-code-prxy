@@ -1,12 +1,13 @@
 package dashboard
 
 import (
+	"path/filepath"
 	"testing"
 	"time"
 )
 
 func TestStoreAggregatesTotals(t *testing.T) {
-	s := NewStore()
+	s := NewStore("")
 	s.Record("****aaaa", "deepseek/deepseek-v4-pro", 100, 20)
 	s.Record("****aaaa", "deepseek/deepseek-v4-pro", 50, 10)
 	s.Record("****bbbb", "zai-org/GLM-5", 30, 5)
@@ -27,7 +28,7 @@ func TestStoreAggregatesTotals(t *testing.T) {
 }
 
 func TestStorePerKeyBreakdown(t *testing.T) {
-	s := NewStore()
+	s := NewStore("")
 	s.Record("****aaaa", "m1", 100, 1)
 	s.Record("****aaaa", "m1", 100, 1)
 	s.Record("****bbbb", "m2", 5, 5)
@@ -49,7 +50,7 @@ func TestStorePerKeyBreakdown(t *testing.T) {
 }
 
 func TestStorePerModelBreakdown(t *testing.T) {
-	s := NewStore()
+	s := NewStore("")
 	s.Record("****aaaa", "deepseek/deepseek-v4-pro", 10, 2)
 	s.Record("****bbbb", "zai-org/GLM-5", 7, 3)
 
@@ -67,7 +68,7 @@ func TestStorePerModelBreakdown(t *testing.T) {
 }
 
 func TestStoreBucketsCoverRange(t *testing.T) {
-	s := NewStore()
+	s := NewStore("")
 	s.Record("****aaaa", "m", 10, 1)
 
 	for _, r := range []string{Range24h, Range7d, Range30d} {
@@ -91,7 +92,7 @@ func TestStoreBucketsCoverRange(t *testing.T) {
 }
 
 func TestStoreIgnoresZeroUsage(t *testing.T) {
-	s := NewStore()
+	s := NewStore("")
 	s.Record("****aaaa", "m", 0, 0)
 	if snap := s.Snapshot(Range24h); snap.Totals.Requests != 0 {
 		t.Errorf("zero-usage events should not be recorded, got %d", snap.Totals.Requests)
@@ -99,7 +100,7 @@ func TestStoreIgnoresZeroUsage(t *testing.T) {
 }
 
 func TestStoreRingEviction(t *testing.T) {
-	s := NewStore()
+	s := NewStore("")
 	total := maxEvents + 25
 	for i := 0; i < total; i++ {
 		s.Record("****aaaa", "m", 1, 0)
@@ -115,7 +116,7 @@ func TestStoreRingEviction(t *testing.T) {
 }
 
 func TestStoreSnapshotIgnoresForeignRange(t *testing.T) {
-	s := NewStore()
+	s := NewStore("")
 	s.Record("****aaaa", "m", 5, 5)
 	if snap := s.Snapshot("nonsense"); snap.Range != Range24h {
 		t.Errorf("unknown range should fall back to 24h, got %q", snap.Range)
@@ -123,7 +124,7 @@ func TestStoreSnapshotIgnoresForeignRange(t *testing.T) {
 }
 
 func TestStoreOldEventsExcludedFrom24h(t *testing.T) {
-	s := NewStore()
+	s := NewStore("")
 	now := time.Now()
 	s.push(Event{At: now.Add(-48 * time.Hour), Key: "old", Input: 1000, Output: 1000})
 	s.push(Event{At: now.Add(-time.Minute), Key: "new", Input: 5, Output: 5})
@@ -135,5 +136,38 @@ func TestStoreOldEventsExcludedFrom24h(t *testing.T) {
 	snap30 := s.Snapshot(Range30d)
 	if snap30.Totals.Total != 2010 {
 		t.Errorf("30d should include both events, got total %d", snap30.Totals.Total)
+	}
+}
+
+func TestStorePersistsAcrossReopen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usage.db")
+	s := NewStore(path)
+	defer s.Close()
+	s.Record("****1111", "deepseek/deepseek-v4-flash", 100, 20)
+	s.Record("****1111", "deepseek/deepseek-v4-flash", 50, 10)
+
+	// Simulate a restart: a fresh store on the same file.
+	s2 := NewStore(path)
+	defer s2.Close()
+	snap := s2.Snapshot(Range24h)
+	if snap.Totals.Requests != 2 || snap.Totals.Input != 150 || snap.Totals.Output != 30 {
+		t.Fatalf("persisted totals = %+v, want 2 requests / 150 in / 30 out", snap.Totals)
+	}
+	if len(snap.ByKey) != 1 || snap.ByKey[0].Key != "****1111" {
+		t.Fatalf("by-key = %+v, want one entry for ****1111", snap.ByKey)
+	}
+}
+
+func TestStoreUnopenableDBFallsBackToMemory(t *testing.T) {
+	s := NewStore("/proc/definitely/not/writable/usage.db")
+	defer s.Close()
+	if s.db != nil {
+		t.Fatal("expected no database handle for an unopenable path")
+	}
+	s.Record("****9999", "m", 5, 5)
+	snap := s.Snapshot(Range24h)
+	if snap.Totals.Requests != 1 || snap.Totals.Total != 10 {
+		t.Fatalf("in-memory totals = %+v, want 1 request / 10 tokens", snap.Totals)
 	}
 }

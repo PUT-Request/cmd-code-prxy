@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/dev2k6/command-code-proxy-server/internal/config"
@@ -72,7 +73,14 @@ func main() {
 	// Dashboard (optional): serves the management UI and records token usage.
 	var dash *dashboard.Dashboard
 	if cfg.Dashboard.Enabled && cfg.Dashboard.Username != "" && cfg.Dashboard.Password != "" {
-		store := dashboard.NewStore()
+		dbPath := cfg.Dashboard.DBPath
+		if dbPath != "" && !filepath.IsAbs(dbPath) {
+			if dir := filepath.Dir(configFile); dir != "" {
+				dbPath = filepath.Join(dir, dbPath)
+			}
+		}
+		store := dashboard.NewStore(dbPath)
+		defer store.Close()
 		dash, err = dashboard.New(cfg.Dashboard, cfg.Host, configFile, cfg.APIKeys, store)
 		if err != nil {
 			log.Fatalf("Failed to init dashboard: %v", err)

@@ -25,6 +25,9 @@ type DashboardConfig struct {
 	// Zero shares the API listener. A separate port lets you expose only the
 	// panel, or keep the API on its existing port.
 	Port string `yaml:"port"`
+	// DBPath is where token usage is persisted (SQLite). Empty keeps
+	// usage in memory only.
+	DBPath string `yaml:"db_path"`
 }
 
 // Config holds all runtime configuration for the proxy server.

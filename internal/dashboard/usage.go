@@ -1,6 +1,8 @@
 package dashboard
 
 import (
+	"database/sql"
+	"log"
 	"sort"
 	"sync"
 	"time"
@@ -19,17 +21,41 @@ type Event struct {
 	Output int
 }
 
-// Store accumulates usage in memory. Reset on restart by design.
+// Store accumulates usage. Events are written through to the SQLite
+// database when one is attached; the ring is a bounded in-memory
+// cache so aggregation stays fast. Without a database the store is
+// in-memory only.
 type Store struct {
 	mu     sync.Mutex
+	db     *sql.DB
 	events []Event
 	start  int // next write position
 	count  int // number of live events
 }
 
-// NewStore returns an empty store.
-func NewStore() *Store {
-	return &Store{events: make([]Event, maxEvents)}
+// NewStore returns a store backed by the SQLite database at path.
+// An empty path, an unopenable database, or a database with no
+// readable history all fall back to in-memory-only behavior.
+func NewStore(path string) *Store {
+	db, events := initUsageDB(path)
+	s := &Store{events: make([]Event, maxEvents), db: db}
+	for _, e := range events {
+		s.push(e)
+	}
+	return s
+}
+
+// Close releases the underlying database. Safe to call twice and
+// on a store with no database.
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return nil
+	}
+	err := s.db.Close()
+	s.db = nil
+	return err
 }
 
 // Record adds a completed request. Empty keys are stored as-is; callers pass
@@ -41,15 +67,29 @@ func (s *Store) Record(key, model string, input, output int) {
 	s.push(Event{At: time.Now(), Key: key, Model: model, Input: input, Output: output})
 }
 
-// push writes an event into the ring, bypassing validation. Used by Record and
-// by tests that need to inject events at a specific time.
+// push writes an event into the ring and the database. Used by
+// Record and by tests that need to inject events at a specific time.
 func (s *Store) push(e Event) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.writeDBLocked(e)
 	s.events[s.start] = e
 	s.start = (s.start + 1) % len(s.events)
 	if s.count < len(s.events) {
 		s.count++
+	}
+}
+
+// writeDBLocked persists an event. Errors are logged once and then
+// suppressed: a failing database must not break request serving.
+func (s *Store) writeDBLocked(e Event) {
+	if s.db == nil {
+		return
+	}
+	if _, err := s.db.Exec(`INSERT INTO usage_events
+		(at, key_fp, model, input, output) VALUES (?, ?, ?, ?, ?)`,
+		e.At.Unix(), e.Key, e.Model, e.Input, e.Output); err != nil {
+		log.Printf("[WARN] Could not persist usage event: %v", err)
 	}
 }
 

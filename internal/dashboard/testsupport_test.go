@@ -63,7 +63,7 @@ func newTestDashboard(t *testing.T) http.Handler {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	d, err := New(cfg.Dashboard, cfg.Host, path, cfg.APIKeys, NewStore())
+	d, err := New(cfg.Dashboard, cfg.Host, path, cfg.APIKeys, NewStore(""))
 	if err != nil {
 		t.Fatalf("new dashboard: %v", err)
 	}
@@ -75,7 +75,7 @@ func newTestDashboard(t *testing.T) http.Handler {
 // NewHandlerFor mounts a dashboard for the given config, with no key file.
 func NewHandlerFor(t *testing.T, dc config.DashboardConfig) http.Handler {
 	t.Helper()
-	d, err := New(dc, "127.0.0.1", newTestConfig(t, testConfigBody), nil, NewStore())
+	d, err := New(dc, "127.0.0.1", newTestConfig(t, testConfigBody), nil, NewStore(""))
 	if err != nil {
 		t.Fatalf("new dashboard: %v", err)
 	}

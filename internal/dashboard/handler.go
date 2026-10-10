@@ -47,7 +47,7 @@ func New(cfg config.DashboardConfig, host, configPath string, apiKeys []config.A
 	cp := make([]config.APIKeyDef, len(apiKeys))
 	copy(cp, apiKeys)
 	if usage == nil {
-		usage = NewStore()
+		usage = NewStore("")
 	}
 
 	pages, err := loadPages()
