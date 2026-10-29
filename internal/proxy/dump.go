@@ -163,6 +163,13 @@ func (d *Dumper) run() {
 			d.write(rec)
 		case <-syncTick.C:
 			d.syncNow()
+			// Rotate-style retention: prune on every tick so max_gb bounds
+			// the folder continuously, not just at startup or part changes.
+			if d.maxBytes > 0 {
+				d.mu.Lock()
+				d.pruneLocked()
+				d.mu.Unlock()
+			}
 		}
 	}
 }

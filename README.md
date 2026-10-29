@@ -139,7 +139,7 @@ limits:
   input_tokens: 256000
   output_tokens: 32000
 
-# Request archive for distillation: 1:1 request/response JSONL per day.
+# Request archive for distillation: 1:1 router request/response JSONL.
 dump:
   enabled: true
   dir: "dumps"
@@ -378,14 +378,16 @@ For router requests, checked before any upstream call:
 
 ## Request archive (`dump`)
 
-Every request/response can be archived 1:1 for later distillation:
+Every `free:auto` request/response can be archived 1:1 for later
+distillation. The archive is **router-only**: direct model requests are
+never written to it.
 
 ```yaml
 dump:
   enabled: true
   dir: "dumps"          # folder next to config.yaml; created if missing
   include_images: false # keep base64 images out of the archive (size!)
-  max_gb: 20            # prune oldest files beyond this size (0 = forever)
+  max_gb: 20            # rotating cap: oldest files deleted past this
 ```
 
 One JSON object per line, one file per day (`dumps/2026-10-29.jsonl`),
@@ -400,7 +402,7 @@ rotating to a new part at 100 MB:
 
 - `cc_request` is the exact CommandCode body that upstream accepted;
   `response` is the assembled answer (text, tool calls, reasoning, finish,
-  usage). Failed requests and size-rejected requests are archived too, with
+  usage). Failed and size-rejected router requests are archived too, with
   `status` and `error` set and no `response`.
 - With `include_images: false` (default), base64 payloads become
   `[image stripped: N bytes]` — the archive stays text-usable without
@@ -408,6 +410,9 @@ rotating to a new part at 100 MB:
 - Written off the request path by a single writer goroutine (bounded queue,
   10s fsync); an overflowing queue drops records with a warning rather than
   ever blocking a request. Files append across restarts.
+- `max_gb` rotates continuously: the folder is checked every 10 seconds and
+  the oldest files are deleted until the total is under the cap (the file
+  currently being written is never deleted). `0` keeps everything forever.
 - The archive holds full prompts and outputs in plaintext next to your
   config — anyone with disk access can read them. Only key fingerprints are
   stored, never raw keys.

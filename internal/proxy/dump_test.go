@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dev2k6/command-code-proxy-server/internal/config"
 )
@@ -210,7 +211,7 @@ func TestHandlerDumpsFailedRequest(t *testing.T) {
 	d := NewDumper(dir, false, 0)
 	p.SetDumper(d)
 
-	w := chatRequest(t, p, `{"model":"prov/model-a:free","messages":[{"role":"user","content":"hi"}],"stream":false}`)
+	w := chatRequest(t, p, `{"model":"free:auto","messages":[{"role":"user","content":"hi"}],"stream":false}`)
 	if w.Code != 400 {
 		t.Fatalf("status = %d", w.Code)
 	}
@@ -233,6 +234,31 @@ func TestHandlerDumpsFailedRequest(t *testing.T) {
 	}
 }
 
+// TestHandlerSkipsDirectModels: the archive is router-only — direct model
+// requests must not be dumped.
+func TestHandlerSkipsDirectModels(t *testing.T) {
+	dir := t.TempDir()
+	up := newRouterUpstream(t)
+	p := newRouterTestProxy(t, up, []string{"prov/model-b:free"})
+	d := NewDumper(dir, false, 0)
+	p.SetDumper(d)
+
+	// Success path (direct) and failure path (direct model-a, always 400s).
+	if w := chatRequest(t, p, `{"model":"prov/model-b:free","messages":[{"role":"user","content":"hi"}],"stream":false}`); w.Code != 200 {
+		t.Fatalf("direct success status = %d", w.Code)
+	}
+	if w := chatRequest(t, p, `{"model":"prov/model-a:free","messages":[{"role":"user","content":"hi"}],"stream":false}`); w.Code != 400 {
+		t.Fatalf("direct failure status = %d", w.Code)
+	}
+	d.Close()
+
+	files, _ := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	if len(files) != 0 {
+		data, _ := os.ReadFile(files[0])
+		t.Fatalf("direct requests were archived: %s", string(data))
+	}
+}
+
 func TestHandlerDumpStreamsToolCalls(t *testing.T) {
 	dir := t.TempDir()
 	srv := newSSEUpstream(t, `{"type":"text-delta","text":"let me check"}
@@ -247,10 +273,11 @@ func TestHandlerDumpStreamsToolCalls(t *testing.T) {
 	})
 	p.BaseURL = srv.URL
 	p.SetLimits(0, 0)
+	p.SetRouter(true, []string{"prov/m:free"}, 5, time.Minute)
 	d := NewDumper(dir, false, 0)
 	p.SetDumper(d)
 
-	w := chatRequest(t, p, `{"model":"prov/m:free","messages":[{"role":"user","content":"hi"}],"stream":false}`)
+	w := chatRequest(t, p, `{"model":"free:auto","messages":[{"role":"user","content":"hi"}],"stream":false}`)
 	if w.Code != 200 {
 		t.Fatalf("status = %d, body %s", w.Code, w.Body.String())
 	}

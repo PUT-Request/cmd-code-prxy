@@ -521,16 +521,18 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if ccResp == nil {
 		// Nobody succeeded: ambiguous 400s blame the request, not the keys.
 		log.Printf("[ERROR] All attempts failed, last error: %d %s", lastStatus, lastMessage)
-		p.dumpRecord(DumpRecord{
-			TS:        time.Now().UTC().Format(time.RFC3339),
-			Client:    clientFingerprint,
-			Requested: openAIReq.Model,
-			Stream:    openAIReq.Stream,
-			Status:    lastStatus,
-			Error:     lastMessage,
-			CCRequest: p.dumper.rawJSON(lastReqJSON),
-			MS:        time.Since(started).Milliseconds(),
-		})
+		if IsRouterModel(canonicalModel) {
+			p.dumpRecord(DumpRecord{
+				TS:        time.Now().UTC().Format(time.RFC3339),
+				Client:    clientFingerprint,
+				Requested: openAIReq.Model,
+				Stream:    openAIReq.Stream,
+				Status:    lastStatus,
+				Error:     lastMessage,
+				CCRequest: p.dumper.rawJSON(lastReqJSON),
+				MS:        time.Since(started).Milliseconds(),
+			})
+		}
 		outStatus := http.StatusBadGateway
 		if lastStatus >= http.StatusBadRequest && lastStatus < http.StatusInternalServerError {
 			outStatus = lastStatus
@@ -549,26 +551,28 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	} else {
 		p.NonStreamResponse(w, ccResp, requestID, actualModel, created, clientFingerprint, capture)
 	}
-	p.dumpRecord(DumpRecord{
-		TS:        time.Now().UTC().Format(time.RFC3339),
-		Client:    clientFingerprint,
-		Requested: openAIReq.Model,
-		Model:     actualModel,
-		Stream:    openAIReq.Stream,
-		Status:    http.StatusOK,
-		CCRequest: p.dumper.rawJSON(lastReqJSON),
-		Response: &DumpResponse{
-			Text:      capture.Text,
-			ToolCalls: capture.ToolCalls,
-			Reasoning: capture.Reasoning,
-			Finish:    capture.Finish,
-			Usage: DumpUsage{
-				Input:  capture.InputTokens,
-				Output: capture.OutputTokens,
+	if IsRouterModel(canonicalModel) {
+		p.dumpRecord(DumpRecord{
+			TS:        time.Now().UTC().Format(time.RFC3339),
+			Client:    clientFingerprint,
+			Requested: openAIReq.Model,
+			Model:     actualModel,
+			Stream:    openAIReq.Stream,
+			Status:    http.StatusOK,
+			CCRequest: p.dumper.rawJSON(lastReqJSON),
+			Response: &DumpResponse{
+				Text:      capture.Text,
+				ToolCalls: capture.ToolCalls,
+				Reasoning: capture.Reasoning,
+				Finish:    capture.Finish,
+				Usage: DumpUsage{
+					Input:  capture.InputTokens,
+					Output: capture.OutputTokens,
+				},
 			},
-		},
-		MS: time.Since(started).Milliseconds(),
-	})
+			MS: time.Since(started).Milliseconds(),
+		})
+	}
 }
 
 // dumpRecord queues a record for the archive; a nil dumper is a no-op.
