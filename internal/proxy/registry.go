@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -138,20 +139,24 @@ func (r *ModelRegistry) Refresh() {
 	r.doRefresh()
 }
 
+// doRefresh fetches the model list with a single upstream key. The model
+// list does not depend on which key asks, so one attempt per refresh cycle
+// is enough — iterating every configured key would multiply worst-case
+// latency by the pool size for no benefit.
 func (r *ModelRegistry) doRefresh() {
 	if r.keyProvider == nil {
 		return
 	}
-	var lastErr error
-	for _, key := range r.keyProvider() {
-		models, err := r.fetch(key)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if len(models) == 0 {
-			continue
-		}
+	keys := r.keyProvider()
+	if len(keys) == 0 {
+		return
+	}
+
+	models, err := r.fetch(keys[0])
+	if err == nil && len(models) == 0 {
+		err = fmt.Errorf("empty model list")
+	}
+	if err == nil {
 		r.mu.Lock()
 		r.models = models
 		r.aliases = buildAliases(models)
@@ -165,9 +170,9 @@ func (r *ModelRegistry) doRefresh() {
 	had := r.fetched
 	r.mu.RUnlock()
 	if !had {
-		log.Printf("[WARN] Model list fetch failed (%v); serving built-in fallback", lastErr)
+		log.Printf("[WARN] Model list fetch failed (%v); serving built-in fallback", err)
 	} else {
-		log.Printf("[WARN] Model list refresh failed (%v); keeping last good list", lastErr)
+		log.Printf("[WARN] Model list refresh failed (%v); keeping last good list", err)
 	}
 	// Advance lastFetch on failure too so a down upstream is not hammered.
 	r.mu.Lock()
