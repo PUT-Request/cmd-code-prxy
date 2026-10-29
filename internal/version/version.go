@@ -23,40 +23,45 @@ var (
 const versionCacheDuration = 30 * time.Minute
 
 // GetCommandCodeVersion fetches the latest version from npm registry
-// It caches the result for 30 minutes to avoid excessive API calls
+// It caches the result for 30 minutes to avoid excessive API calls.
+//
+// The fetch holds the lock so concurrent callers share one in-flight
+// request (bounded by npmFetchTimeout). Failures are negative-cached for
+// the same window: an unreachable npm registry costs one bounded wait per
+// 30 minutes instead of stalling every upstream request.
 func GetCommandCodeVersion() string {
-	versionMu.RLock()
-	info := versionInfo
-	versionMu.RUnlock()
+	versionMu.Lock()
+	defer versionMu.Unlock()
 
 	// Return cached version if still valid
-	if info != nil && time.Since(info.LastUpdated) < versionCacheDuration {
-		return info.Version
+	if versionInfo != nil && time.Since(versionInfo.LastUpdated) < versionCacheDuration {
+		return versionInfo.Version
 	}
 
-	// Fetch new version
 	newInfo, err := fetchVersionFromNPM()
 	if err != nil {
-		// Return cached version on error, or default
-		versionMu.RLock()
-		defer versionMu.RUnlock()
+		// Negative-cache: keep the last known version (or "unknown") and
+		// retry only after the cache window.
+		v := "unknown"
 		if versionInfo != nil {
-			return versionInfo.Version
+			v = versionInfo.Version
 		}
-		return "unknown"
+		versionInfo = &VersionInfo{Version: v, LastUpdated: time.Now()}
+		return v
 	}
 
-	// Update cache
-	versionMu.Lock()
 	versionInfo = newInfo
-	versionMu.Unlock()
-
 	return newInfo.Version
 }
 
+// npmFetchTimeout bounds the npm registry lookup so a stalled network can
+// never hang request handling or startup.
+const npmFetchTimeout = 5 * time.Second
+
 // fetchVersionFromNPM fetches the latest version from npm registry
 func fetchVersionFromNPM() (*VersionInfo, error) {
-	resp, err := http.Get("https://registry.npmjs.org/command-code/latest")
+	client := &http.Client{Timeout: npmFetchTimeout}
+	resp, err := client.Get("https://registry.npmjs.org/command-code/latest")
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch version: %w", err)
 	}
@@ -83,10 +88,15 @@ func fetchVersionFromNPM() (*VersionInfo, error) {
 	}, nil
 }
 
-// init fetches the version on startup (in background)
+// init warms the version cache in the background so the first upstream
+// request does not pay the fetch. Failures are left to
+// GetCommandCodeVersion's bounded retry window.
 func init() {
 	go func() {
-		// Initial fetch - ignore error, will retry on first use
-		_, _ = fetchVersionFromNPM()
+		if info, err := fetchVersionFromNPM(); err == nil {
+			versionMu.Lock()
+			versionInfo = info
+			versionMu.Unlock()
+		}
 	}()
 }

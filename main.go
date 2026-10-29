@@ -133,7 +133,9 @@ func main() {
 	registry := proxy.NewRegistry(p.BaseURL, srv.UpstreamKeys,
 		time.Duration(cfg.Models.RefreshSeconds)*time.Second)
 	p.SetRegistry(registry)
-	registry.Refresh() // best-effort warm-up; failures fall back to defaults
+	// Warm up off the critical path: the server must start listening now;
+	// /v1/models serves the built-in list until this lands.
+	go registry.Refresh()
 
 	// free:auto router over the free-model pool (IDs containing "free").
 	p.SetRouter(cfg.Router.Enabled, cfg.Router.Models, cfg.Router.MaxModelsPerRequest,
@@ -180,11 +182,19 @@ func loadConfig(path string) (*config.Config, error) {
 }
 
 func versionText() string {
-	latest, hasUpdate, err := update.LatestVersion(appVersion)
-	if err != nil || !hasUpdate {
-		return appVersion
-	}
-	return fmt.Sprintf("%s (latest: %s)", appVersion, latest)
+	return appVersion
+}
+
+// announceUpdate checks GitHub for a newer release in the background and
+// prints a notice after the startup banner. Kept off the boot path: an
+// unreachable api.github.com must never delay startup.
+func announceUpdate() {
+	go func() {
+		latest, hasUpdate, err := update.LatestVersion(appVersion)
+		if err == nil && hasUpdate {
+			fmt.Printf("  Update:       %s available (latest: %s)\n", appVersion, latest)
+		}
+	}()
 }
 
 // baseURLOf reports the upstream endpoint in use.
@@ -202,6 +212,7 @@ func printStartupInfo(srv *server.Server, cfg *config.Config, configFile string,
 	fmt.Println("========================================")
 	fmt.Println("")
 	fmt.Printf("  Version:      %s\n", versionText())
+	announceUpdate()
 	fmt.Printf("  Repository:   %s\n", repositoryURL)
 	fmt.Printf("  Config:       %s\n", configFile)
 	fmt.Printf("  Host:         %s\n", srv.GetHost())
