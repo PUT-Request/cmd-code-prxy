@@ -106,8 +106,27 @@ func main() {
 	srv.SetPort(cfg.Port)
 	srv.SetHost(cfg.Host)
 
-	// Request-size limits (defaults: 256k input, 32k output).
+	// Request-size limits (defaults: 256k input, 32k output; free:auto only).
 	p.SetLimits(cfg.Limits.InputTokens, cfg.Limits.OutputTokens)
+
+	// Request archive for distillation (optional): every request/response
+	// 1:1 to daily JSONL files, written off the request path.
+	if cfg.Dump.Enabled {
+		dir := cfg.Dump.Dir
+		if dir == "" {
+			dir = "dumps"
+		}
+		if !filepath.IsAbs(dir) {
+			if base := filepath.Dir(configFile); base != "" && base != "." {
+				dir = filepath.Join(base, dir)
+			}
+		}
+		dumper := proxy.NewDumper(dir, cfg.Dump.IncludeImages, cfg.Dump.MaxGB)
+		if dumper != nil {
+			p.SetDumper(dumper)
+			defer dumper.Close()
+		}
+	}
 
 	// Live model registry: refreshes /v1/models from the upstream provider
 	// list and feeds the free:auto router pool.

@@ -25,3 +25,4 @@ Thumbs.db
 config.yaml
 command-code-proxy-server-linux-amd64
 usage.db
+dumps/

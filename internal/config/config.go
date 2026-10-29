@@ -49,11 +49,24 @@ type RouterConfig struct {
 	Models []string `yaml:"models"`
 }
 
-// LimitsConfig bounds request size. Zero falls back to the defaults
-// (256k input, 32k output).
+// LimitsConfig bounds router request size. Zero falls back to the defaults
+// (256k input, 32k output). Limits apply to free:auto only.
 type LimitsConfig struct {
 	InputTokens  int `yaml:"input_tokens"`
 	OutputTokens int `yaml:"output_tokens"`
+}
+
+// DumpConfig archives every request/response 1:1 to JSONL files for later
+// distillation.
+type DumpConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Dir     string `yaml:"dir"`
+	// IncludeImages keeps base64 image payloads in the archive. Off by
+	// default: screenshots dwarf everything else on disk.
+	IncludeImages bool `yaml:"include_images"`
+	// MaxGB prunes oldest files once the folder exceeds this size. 0 keeps
+	// everything forever.
+	MaxGB int `yaml:"max_gb"`
 }
 
 // Config holds all runtime configuration for the proxy server.
@@ -66,6 +79,7 @@ type Config struct {
 	Models    ModelsConfig    `yaml:"models"`
 	Router    RouterConfig    `yaml:"router"`
 	Limits    LimitsConfig    `yaml:"limits"`
+	Dump      DumpConfig      `yaml:"dump"`
 
 	// BaseURL overrides the CommandCode API endpoint. Empty uses the default.
 	BaseURL string `yaml:"base_url"`

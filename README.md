@@ -17,7 +17,8 @@ Version: `v1.0.8`
 - `free:auto` model router: routes requests across the free-model pool with
   LRU rotation, per-model cooldown, and failover to the next model
 - Live `/v1/models` refreshed from the upstream provider list
-- Request-size limits (256k input / 32k output by default)
+- Request-size limits for `free:auto` (256k input / 32k output by default)
+- 1:1 request/response archive to daily JSONL files for distillation
 - Multiple client API keys, each with a model allowlist
 - Upstream key failover: any upstream error (including 400) retries the
   next key; failed keys cool down for 20 minutes
@@ -133,11 +134,17 @@ router:
   max_models_per_request: 5  # bounded failover across models per request
   models: []                 # optional explicit pool; empty = IDs containing "free"
 
-# Request-size limits. Every model is treated as non-vision with this
-# context bound; larger requests are rejected before reaching upstream.
+# Request-size limits — apply to free:auto only; direct models pass through.
 limits:
   input_tokens: 256000
   output_tokens: 32000
+
+# Request archive for distillation: 1:1 request/response JSONL per day.
+dump:
+  enabled: true
+  dir: "dumps"
+  include_images: false
+  max_gb: 20
 
 # Enable verbose debug logging of request/response bodies.
 debug: false
@@ -349,21 +356,61 @@ current list, so newly published upstream models work without a redeploy.
 
 If the fetch fails, the last good list is kept; on a cold start with no
 reachable upstream, a built-in list is served so the endpoint never breaks.
-Each entry advertises `context_length` equal to the configured input limit
-(256k by default) so clients budget against the bound the proxy actually
-enforces.
+Each entry carries the upstream `context_length`; only the `free:auto`
+router entry advertises the proxy-enforced bound, since that is the only
+place limits apply.
 
-## Request-size limits
+## Request-size limits (router only)
 
-Every model is treated as non-vision with a 256k-token context and a
-32k-token output cap by default (`limits.input_tokens` / `limits.output_tokens`).
-Requests are checked before any upstream call:
+Limits govern `free:auto` requests only — the pool is non-vision models the
+proxy treats as 256k context / 32k output by default (`limits.input_tokens` /
+`limits.output_tokens`). Requests pinned to a concrete model are forwarded
+untouched: no size rejection, and the client's `max_tokens` (or the 64k
+default) goes upstream as-is.
+
+For router requests, checked before any upstream call:
 
 - Estimated input above the limit → `400`. The estimate strips base64 image
   payloads (they are not transmitted as text tokens) and adds a flat
   per-image vision cost.
 - `max_tokens` above the output limit → `400`. When the client omits
   `max_tokens`, the default is clamped to the output limit.
+
+## Request archive (`dump`)
+
+Every request/response can be archived 1:1 for later distillation:
+
+```yaml
+dump:
+  enabled: true
+  dir: "dumps"          # folder next to config.yaml; created if missing
+  include_images: false # keep base64 images out of the archive (size!)
+  max_gb: 20            # prune oldest files beyond this size (0 = forever)
+```
+
+One JSON object per line, one file per day (`dumps/2026-10-29.jsonl`),
+rotating to a new part at 100 MB:
+
+```json
+{"ts":"2026-10-29T13:12:15Z","client":"****1111","requested":"free:auto",
+ "model":"reflection/beam:free","stream":true,"status":200,
+ "cc_request":{...},"response":{"text":"...","tool_calls":[...],
+ "finish":"stop","usage":{"input":50,"output":7}},"ms":1834}
+```
+
+- `cc_request` is the exact CommandCode body that upstream accepted;
+  `response` is the assembled answer (text, tool calls, reasoning, finish,
+  usage). Failed requests and size-rejected requests are archived too, with
+  `status` and `error` set and no `response`.
+- With `include_images: false` (default), base64 payloads become
+  `[image stripped: N bytes]` — the archive stays text-usable without
+  gigabytes of screenshots.
+- Written off the request path by a single writer goroutine (bounded queue,
+  10s fsync); an overflowing queue drops records with a warning rather than
+  ever blocking a request. Files append across restarts.
+- The archive holds full prompts and outputs in plaintext next to your
+  config — anyone with disk access can read them. Only key fingerprints are
+  stored, never raw keys.
 
 ## Supported model aliases
 

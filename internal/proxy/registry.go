@@ -42,7 +42,8 @@ const defaultRefreshInterval = 5 * time.Minute
 
 // upstreamModel is one entry of GET {base}/provider/v1/models.
 type upstreamModel struct {
-	ID string `json:"id"`
+	ID            string `json:"id"`
+	ContextLength int    `json:"context_length"`
 }
 
 // ModelRegistry keeps the live upstream model list. It refreshes lazily and
@@ -205,7 +206,12 @@ func (r *ModelRegistry) fetch(key string) ([]api.OpenAIModel, error) {
 		if i := strings.LastIndex(m.ID, "/"); i >= 0 && i+1 < len(m.ID) {
 			owner = m.ID[:i]
 		}
-		out = append(out, api.OpenAIModel{ID: m.ID, Object: "model", OwnedBy: owner})
+		out = append(out, api.OpenAIModel{
+			ID:            m.ID,
+			Object:        "model",
+			OwnedBy:       owner,
+			ContextLength: m.ContextLength,
+		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil

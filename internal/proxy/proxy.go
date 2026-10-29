@@ -175,9 +175,13 @@ type Proxy struct {
 	// routerMaxModels bounds how many models one request may try.
 	routerMaxModels int
 
-	// limitInput/limitOutput bound request size (0 = unlimited).
+	// limitInput/limitOutput bound router request size (0 = unlimited).
+	// They apply to free:auto only; direct model requests are unrestricted.
 	limitInput  int
 	limitOutput int
+
+	// dumper archives requests 1:1 to JSONL for distillation. Nil = off.
+	dumper *Dumper
 }
 
 // NewProxy creates a new proxy instance.
@@ -216,7 +220,7 @@ func (p *Proxy) SetRouter(enabled bool, pool []string, maxModels int, cooldown t
 	}
 }
 
-// SetLimits configures request-size bounds (<= 0 keeps the default).
+// SetLimits configures router request-size bounds (<= 0 keeps the default).
 func (p *Proxy) SetLimits(inputTokens, outputTokens int) {
 	p.limitInput = DefaultInputTokenLimit
 	p.limitOutput = DefaultOutputTokenLimit
@@ -227,6 +231,9 @@ func (p *Proxy) SetLimits(inputTokens, outputTokens int) {
 		p.limitOutput = outputTokens
 	}
 }
+
+// SetDumper attaches the request archive writer.
+func (p *Proxy) SetDumper(d *Dumper) { p.dumper = d }
 
 // validReasoningEfforts are the effort levels the upstream accepts.
 var validReasoningEfforts = map[string]bool{
@@ -402,16 +409,9 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Request-size limits: every model is treated as a 256k-context,
-	// 32k-output model by default; oversized requests are rejected before
-	// any upstream call.
-	if err := p.checkLimits(body, openAIReq); err != nil {
-		p.writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
-		return
-	}
-	if openAIReq.MaxTokens == nil && openAIReq.MaxCompletionTokens == nil {
-		// Clamp the default output budget to the configured limit; the
-		// old hardcoded 64000 would violate it.
+	// Router output clamp runs before the CC body is built so the default
+	// flows into the request that gets archived.
+	if IsRouterModel(canonicalModel) && openAIReq.MaxTokens == nil && openAIReq.MaxCompletionTokens == nil {
 		v := p.effectiveMaxTokens(openAIReq)
 		openAIReq.MaxTokens = &v
 	}
@@ -422,6 +422,32 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to build request", "server_error")
 		return
+	}
+	reqJSON, err := json.Marshal(ccBody)
+	if err != nil {
+		p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to build request", "server_error")
+		return
+	}
+	p.debugf("[DEBUG] CommandCode request body: %s", truncateLog(string(reqJSON)))
+
+	// Request-size limits apply to the router only: free:auto runs on the
+	// non-vision free pool (256k context / 32k output by default), while
+	// direct model requests keep whatever the upstream model supports.
+	if IsRouterModel(canonicalModel) {
+		if err := p.checkLimits(body, openAIReq); err != nil {
+			p.dumpRecord(DumpRecord{
+				TS:        time.Now().UTC().Format(time.RFC3339),
+				Client:    clientKeyFingerprint(keyDef),
+				Requested: openAIReq.Model,
+				Stream:    openAIReq.Stream,
+				Status:    http.StatusBadRequest,
+				Error:     err.Error(),
+				CCRequest: p.dumper.rawJSON(reqJSON),
+				MS:        0,
+			})
+			p.writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+			return
+		}
 	}
 
 	// Determine upstream CC keys to try
@@ -443,10 +469,13 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// request must not poison the whole pool with cooldowns.
 	var pendingModelFail []string
 
+	started := time.Now()
+	clientFingerprint := clientKeyFingerprint(keyDef)
 	var ccResp *http.Response
 	actualModel := candidates[0]
 	lastStatus := http.StatusBadGateway
 	lastMessage := "all upstream keys failed"
+	var lastReqJSON []byte
 
 	for idx, model := range candidates {
 		ccBody.Params.Model = model
@@ -455,6 +484,7 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to build request", "server_error")
 			return
 		}
+		lastReqJSON = reqJSON
 		p.debugf("[DEBUG] CommandCode request body: %s", truncateLog(string(reqJSON)))
 
 		// Two-pass CC key failover for this model (see tryUpstream).
@@ -491,6 +521,16 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if ccResp == nil {
 		// Nobody succeeded: ambiguous 400s blame the request, not the keys.
 		log.Printf("[ERROR] All attempts failed, last error: %d %s", lastStatus, lastMessage)
+		p.dumpRecord(DumpRecord{
+			TS:        time.Now().UTC().Format(time.RFC3339),
+			Client:    clientFingerprint,
+			Requested: openAIReq.Model,
+			Stream:    openAIReq.Stream,
+			Status:    lastStatus,
+			Error:     lastMessage,
+			CCRequest: p.dumper.rawJSON(lastReqJSON),
+			MS:        time.Since(started).Milliseconds(),
+		})
 		outStatus := http.StatusBadGateway
 		if lastStatus >= http.StatusBadRequest && lastStatus < http.StatusInternalServerError {
 			outStatus = lastStatus
@@ -502,12 +542,39 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	requestID := "chatcmpl-" + uuid.New().String()[:29]
 	created := time.Now().Unix()
-	clientFingerprint := clientKeyFingerprint(keyDef)
 
+	capture := &dumpCapture{}
 	if openAIReq.Stream {
-		p.StreamResponse(w, r, ccResp, requestID, actualModel, created, clientFingerprint)
+		p.StreamResponse(w, r, ccResp, requestID, actualModel, created, clientFingerprint, capture)
 	} else {
-		p.NonStreamResponse(w, ccResp, requestID, actualModel, created, clientFingerprint)
+		p.NonStreamResponse(w, ccResp, requestID, actualModel, created, clientFingerprint, capture)
+	}
+	p.dumpRecord(DumpRecord{
+		TS:        time.Now().UTC().Format(time.RFC3339),
+		Client:    clientFingerprint,
+		Requested: openAIReq.Model,
+		Model:     actualModel,
+		Stream:    openAIReq.Stream,
+		Status:    http.StatusOK,
+		CCRequest: p.dumper.rawJSON(lastReqJSON),
+		Response: &DumpResponse{
+			Text:      capture.Text,
+			ToolCalls: capture.ToolCalls,
+			Reasoning: capture.Reasoning,
+			Finish:    capture.Finish,
+			Usage: DumpUsage{
+				Input:  capture.InputTokens,
+				Output: capture.OutputTokens,
+			},
+		},
+		MS: time.Since(started).Milliseconds(),
+	})
+}
+
+// dumpRecord queues a record for the archive; a nil dumper is a no-op.
+func (p *Proxy) dumpRecord(rec DumpRecord) {
+	if p.dumper != nil {
+		p.dumper.Record(rec)
 	}
 }
 
@@ -783,7 +850,7 @@ func isTransientStatus(status int) bool {
 }
 
 // StreamResponse handles streaming response from CommandCode to OpenAI SSE
-func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *http.Response, requestID, model string, created int64, clientKey string) {
+func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *http.Response, requestID, model string, created int64, clientKey string, capture *dumpCapture) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		p.writeOpenAIError(w, http.StatusInternalServerError, "Streaming not supported", "server_error")
@@ -803,6 +870,29 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 	toolCallIndex := 0
 	lastToolUseIndex := -1
 	toolCallIndexes := map[string]int{}
+
+	// Capture accumulation: mirrors what the client sees, for the archive.
+	var capText, capReasoning strings.Builder
+	var capCalls []api.ToolCall
+	capByStreamIdx := map[int]int{}
+	capByID := map[string]int{}
+	captureCall := func(streamIdx int, id, name, args string) {
+		if capture == nil {
+			return
+		}
+		capByStreamIdx[streamIdx] = len(capCalls)
+		if id != "" {
+			capByID[id] = len(capCalls)
+		}
+		capCalls = append(capCalls, api.ToolCall{
+			ID:   id,
+			Type: "function",
+			Function: api.FunctionCall{
+				Name:      name,
+				Arguments: args,
+			},
+		})
+	}
 
 	for scanner.Scan() {
 		select {
@@ -824,6 +914,7 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 
 		switch event.Type {
 		case "text-delta":
+			capText.WriteString(event.Text)
 			delta := api.OpenAIDelta{Content: event.Text}
 			if !sentRole {
 				delta.Role = "assistant"
@@ -841,6 +932,7 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 			if event.Text == "" {
 				continue
 			}
+			capReasoning.WriteString(event.Text)
 			delta := api.OpenAIDelta{ReasoningContent: event.Text}
 			if !sentRole {
 				delta.Role = "assistant"
@@ -859,6 +951,7 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 
 		case "tool-use":
 			lastToolUseIndex = toolCallIndex
+			captureCall(toolCallIndex, event.ToolCallID, event.ToolName, "")
 			toolCalls := []api.OpenAIDeltaToolCall{{
 				Index:    toolCallIndex,
 				ID:       event.ToolCallID,
@@ -887,6 +980,9 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 				// schema (index >= 0) and made clients drop the call.
 				deltaIdx = 0
 			}
+			if ci, ok := capByStreamIdx[deltaIdx]; ok {
+				capCalls[ci].Function.Arguments += event.Text
+			}
 			toolCalls := []api.OpenAIDeltaToolCall{{
 				Index:    deltaIdx,
 				Function: &api.OpenAIDeltaFunction{Arguments: event.Text},
@@ -903,6 +999,9 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 			if _, ok := toolCallIndexes[event.ID]; !ok {
 				toolCallIndexes[event.ID] = toolCallIndex
 				toolCallIndex++
+			}
+			if _, ok := capByID[event.ID]; !ok {
+				captureCall(toolCallIndexes[event.ID], event.ID, event.ToolName, "")
 			}
 			delta := api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
 				Index: toolCallIndexes[event.ID],
@@ -931,6 +1030,9 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 				toolCallIndexes[event.ID] = idx
 				toolCallIndex++
 			}
+			if ci, ok := capByStreamIdx[idx]; ok {
+				capCalls[ci].Function.Arguments += event.Delta
+			}
 			p.WriteSSE(w, flusher, api.OpenAIChatResponse{
 				ID:      requestID,
 				Object:  "chat.completion.chunk",
@@ -956,6 +1058,7 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 					args = string(data)
 				}
 			}
+			captureCall(idx, event.ToolCallID, event.ToolName, args)
 			delta := api.OpenAIDelta{ToolCalls: []api.OpenAIDeltaToolCall{{
 				Index: idx,
 				ID:    event.ToolCallID,
@@ -979,6 +1082,9 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 
 		case "finish":
 			seenFinish = true
+			if capture != nil {
+				capture.Finish = event.FinishReason
+			}
 			// Upstream reports usage only on the final event. Without this the
 			// streaming path reported zero tokens, so every streaming request
 			// (including all tool-call traffic) was invisible in stats.
@@ -1034,6 +1140,13 @@ func (p *Proxy) StreamResponse(w http.ResponseWriter, r *http.Request, ccResp *h
 		flusher.Flush()
 	}
 	p.record(clientKey, model, inputTokens, outputTokens)
+	if capture != nil {
+		capture.Text = capText.String()
+		capture.Reasoning = capReasoning.String()
+		capture.ToolCalls = capCalls
+		capture.InputTokens = inputTokens
+		capture.OutputTokens = outputTokens
+	}
 }
 
 // record forwards usage to the dashboard when one is attached.
@@ -1051,7 +1164,7 @@ func (p *Proxy) WriteSSE(w io.Writer, flusher http.Flusher, resp api.OpenAIChatR
 }
 
 // NonStreamResponse handles non-streaming response
-func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, requestID, model string, created int64, clientKey string) {
+func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, requestID, model string, created int64, clientKey string, capture *dumpCapture) {
 	scanner := newLineScanner(ccResp.Body)
 	seenFinish := false
 	var streamErr string
@@ -1061,6 +1174,7 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 	var reasoningContent strings.Builder
 	var inputTokens, outputTokens int
 	var hasToolCalls bool
+	var rawFinish string
 	var toolCalls []api.ToolCall
 	toolCallByID := map[string]int{}
 	toolInputBuffers := map[string]*strings.Builder{}
@@ -1147,6 +1261,7 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 			}
 		case "finish":
 			seenFinish = true
+			rawFinish = event.FinishReason
 			if event.TotalUsage != nil {
 				inputTokens = event.TotalUsage.InputTokens
 				outputTokens = event.TotalUsage.OutputTokens
@@ -1194,6 +1309,14 @@ func (p *Proxy) NonStreamResponse(w http.ResponseWriter, ccResp *http.Response, 
 		msg.Content = nil
 		msg.ToolCalls = toolCalls
 		finishReason = "tool_calls"
+	}
+	if capture != nil {
+		capture.Text = content.String()
+		capture.Reasoning = reasoningContent.String()
+		capture.ToolCalls = toolCalls
+		capture.Finish = rawFinish
+		capture.InputTokens = inputTokens
+		capture.OutputTokens = outputTokens
 	}
 
 	response := api.OpenAIChatResponse{
@@ -1514,13 +1637,11 @@ func (p *Proxy) HandleModels(w http.ResponseWriter, r *http.Request) {
 		allModels = defaultModels
 	}
 
-	// Copy so we never mutate the registry's slice, and advertise the
-	// proxy-enforced context bound so clients budget correctly.
+	// Copy so we never mutate the registry's slice. Real models keep the
+	// upstream context_length; only the router virtual model advertises the
+	// proxy-enforced bound, since that is the only place limits apply.
 	out := make([]api.OpenAIModel, len(allModels))
 	copy(out, allModels)
-	for i := range out {
-		out[i].ContextLength = p.contextLimit()
-	}
 	if p.routerEnabled {
 		out = append(out, api.OpenAIModel{
 			ID:            RouterModelID,

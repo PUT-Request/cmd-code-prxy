@@ -322,35 +322,52 @@ func TestRouterDisabledRejects(t *testing.T) {
 	}
 }
 
-func TestLimitsRejectBeforeUpstream(t *testing.T) {
+func TestLimitsApplyToRouterOnly(t *testing.T) {
 	up := newRouterUpstream(t)
-	p := newRouterTestProxy(t, up, nil)
+	p := newRouterTestProxy(t, up, []string{"prov/model-b:free"})
 
-	tooBig := `{"model":"prov/model-b:free","messages":[{"role":"user","content":"` +
+	oversized := `{"model":"free:auto","messages":[{"role":"user","content":"` +
 		strings.Repeat("a", 1_200_000) + `"}]}`
-	if w := chatRequest(t, p, tooBig); w.Code != http.StatusBadRequest {
-		t.Fatalf("oversized status = %d, want 400", w.Code)
+	if w := chatRequest(t, p, oversized); w.Code != http.StatusBadRequest {
+		t.Fatalf("oversized router status = %d, want 400", w.Code)
 	}
-	tooMuchOut := `{"model":"prov/model-b:free","messages":[{"role":"user","content":"hi"}],"max_tokens":99999}`
+	tooMuchOut := `{"model":"free:auto","messages":[{"role":"user","content":"hi"}],"max_tokens":99999}`
 	if w := chatRequest(t, p, tooMuchOut); w.Code != http.StatusBadRequest {
-		t.Fatalf("max_tokens status = %d, want 400", w.Code)
+		t.Fatalf("router max_tokens status = %d, want 400", w.Code)
 	}
 	if len(up.seen()) != 0 {
-		t.Fatal("rejected requests reached upstream")
+		t.Fatal("rejected router requests reached upstream")
+	}
+
+	// The same oversized requests pinned to a direct model are forwarded
+	// untouched: limits govern the router only.
+	directOversized := `{"model":"prov/model-b:free","messages":[{"role":"user","content":"` +
+		strings.Repeat("a", 1_200_000) + `"}]}`
+	if w := chatRequest(t, p, directOversized); w.Code != http.StatusOK {
+		t.Fatalf("direct oversized status = %d, want pass-through", w.Code)
+	}
+	directOut := `{"model":"prov/model-b:free","messages":[{"role":"user","content":"hi"}],"max_tokens":99999}`
+	if w := chatRequest(t, p, directOut); w.Code != http.StatusOK {
+		t.Fatalf("direct max_tokens status = %d, want pass-through", w.Code)
 	}
 }
 
-func TestDefaultMaxTokensSentUpstream(t *testing.T) {
+func TestDefaultMaxTokensPerPath(t *testing.T) {
 	up := newRouterUpstream(t)
-	p := newRouterTestProxy(t, up, nil)
-	body := `{"model":"prov/model-b:free","messages":[{"role":"user","content":"hi"}]}`
-	if w := chatRequest(t, p, body); w.Code != http.StatusOK {
-		t.Fatalf("status = %d", w.Code)
+	p := newRouterTestProxy(t, up, []string{"prov/model-b:free"})
+
+	// Direct model: unclamped default (the pre-router behavior).
+	if w := chatRequest(t, p, `{"model":"prov/model-b:free","messages":[{"role":"user","content":"hi"}]}`); w.Code != http.StatusOK {
+		t.Fatalf("direct status = %d", w.Code)
+	}
+	// Router: default clamped to the output limit.
+	if w := chatRequest(t, p, `{"model":"free:auto","messages":[{"role":"user","content":"hi"}]}`); w.Code != http.StatusOK {
+		t.Fatalf("router status = %d", w.Code)
 	}
 	up.mu.Lock()
 	defer up.mu.Unlock()
-	if len(up.maxTokens) != 1 || up.maxTokens[0] != DefaultOutputTokenLimit {
-		t.Fatalf("upstream max_tokens = %v, want [%d] (clamped default)", up.maxTokens, DefaultOutputTokenLimit)
+	if len(up.maxTokens) != 2 || up.maxTokens[0] != 64000 || up.maxTokens[1] != DefaultOutputTokenLimit {
+		t.Fatalf("upstream max_tokens = %v, want [64000 %d]", up.maxTokens, DefaultOutputTokenLimit)
 	}
 }
 
@@ -378,8 +395,13 @@ func TestModelsEndpointRouterAndContext(t *testing.T) {
 	if _, ok := ids[RouterModelID]; !ok {
 		t.Fatalf("/v1/models missing %s: %v", RouterModelID, ids)
 	}
-	if ids["prov/plain"].ContextLength != DefaultInputTokenLimit {
-		t.Fatalf("context_length = %d, want %d", ids["prov/plain"].ContextLength, DefaultInputTokenLimit)
+	// Real models keep the upstream context_length (the mock reported none,
+	// so 0); only the router virtual model advertises the enforced bound.
+	if ids["prov/plain"].ContextLength != 0 {
+		t.Fatalf("real model context_length = %d, want upstream value untouched", ids["prov/plain"].ContextLength)
+	}
+	if ids[RouterModelID].ContextLength != DefaultInputTokenLimit {
+		t.Fatalf("router context_length = %d, want %d", ids[RouterModelID].ContextLength, DefaultInputTokenLimit)
 	}
 	if ids[RouterModelID].OwnedBy != "commandcode-proxy" {
 		t.Fatalf("router owned_by = %q", ids[RouterModelID].OwnedBy)
