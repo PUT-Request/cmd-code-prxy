@@ -171,3 +171,35 @@ func TestStoreUnopenableDBFallsBackToMemory(t *testing.T) {
 		t.Fatalf("in-memory totals = %+v, want 1 request / 10 tokens", snap.Totals)
 	}
 }
+
+// TestReopenDoesNotDuplicateRows guards the startup-duplication bug: loading
+// history used to re-insert every row, doubling usage_events per restart until
+// startup drowned in it.
+func TestReopenDoesNotDuplicateRows(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usage.db")
+
+	s := NewStore(path)
+	s.Record("****1111", "m", 10, 5)
+	s.Record("****2222", "m", 20, 5)
+	s.Record("****1111", "m", 30, 5)
+	s.Close()
+
+	for i := 0; i < 3; i++ {
+		s2 := NewStore(path)
+		if snap := s2.Snapshot(Range24h); snap.Totals.Requests != 3 {
+			t.Fatalf("reopen %d: hydrated requests = %d, want 3", i, snap.Totals.Requests)
+		}
+		s2.Close()
+	}
+
+	final := NewStore(path)
+	defer final.Close()
+	var n int
+	if err := final.db.QueryRow(`SELECT COUNT(*) FROM usage_events`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("rows after 4 opens = %d, want 3 (no duplicates)", n)
+	}
+}

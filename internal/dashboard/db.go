@@ -49,16 +49,26 @@ func openUsageDB(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-// pruneUsage deletes events older than the retention window.
+// pruneUsage deletes events older than the retention window and logs how
+// many rows went away.
 func pruneUsage(db *sql.DB, cutoff time.Time) error {
-	_, err := db.Exec(`DELETE FROM usage_events WHERE at < ?`, cutoff.Unix())
-	return err
+	res, err := db.Exec(`DELETE FROM usage_events WHERE at < ?`, cutoff.Unix())
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n > 0 {
+		log.Printf("[USAGE] Pruned %d usage rows older than %d days", n, int(retention.Hours()/24))
+	}
+	return nil
 }
 
-// loadUsage reads events newer than cutoff in chronological order.
-func loadUsage(db *sql.DB, cutoff time.Time) ([]Event, error) {
+// loadUsage reads at most limit events newer than cutoff, newest first, and
+// returns them in chronological order. The limit keeps startup bounded no
+// matter how large the table has grown: the in-memory ring cannot hold more
+// than maxEvents anyway.
+func loadUsage(db *sql.DB, cutoff time.Time, limit int) ([]Event, error) {
 	rows, err := db.Query(`SELECT at, key_fp, model, input, output
-		FROM usage_events WHERE at >= ? ORDER BY at ASC`, cutoff.Unix())
+		FROM usage_events WHERE at >= ? ORDER BY at DESC LIMIT ?`, cutoff.Unix(), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -73,7 +83,14 @@ func loadUsage(db *sql.DB, cutoff time.Time) ([]Event, error) {
 		e.At = time.Unix(at, 0)
 		out = append(out, e)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Newest-first query: reverse to chronological.
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
 }
 
 // ensureDir creates a directory (and parents) if it does not exist.
@@ -99,6 +116,9 @@ func initUsageDB(path string) (*sql.DB, []Event) {
 	if path == "" {
 		return nil, nil
 	}
+	if st, err := os.Stat(path); err == nil {
+		log.Printf("[USAGE] Opening usage db %s (%.1f MB)", path, float64(st.Size())/(1<<20))
+	}
 	db, err := openDB(path)
 	if err != nil {
 		log.Printf("[WARN] Usage database unavailable (%v); usage stats stay in memory", err)
@@ -107,7 +127,7 @@ func initUsageDB(path string) (*sql.DB, []Event) {
 	if err := pruneUsage(db, time.Now().Add(-retention)); err != nil {
 		log.Printf("[WARN] Could not prune old usage rows: %v", err)
 	}
-	events, err := loadUsage(db, time.Now().Add(-retention))
+	events, err := loadUsage(db, time.Now().Add(-retention), maxEvents)
 	if err != nil {
 		log.Printf("[WARN] Could not load usage history: %v", err)
 		events = nil

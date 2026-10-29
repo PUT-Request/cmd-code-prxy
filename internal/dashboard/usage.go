@@ -39,9 +39,21 @@ type Store struct {
 func NewStore(path string) *Store {
 	db, events := initUsageDB(path)
 	s := &Store{events: make([]Event, maxEvents), db: db}
+	// Hydrate the in-memory view WITHOUT writing back to the database.
+	// Writing here re-inserted every loaded row, doubling usage_events on
+	// each restart until startup drowned in a massive table.
+	loadStart := time.Now()
+	s.mu.Lock()
 	for _, e := range events {
-		s.push(e)
+		s.events[s.start] = e
+		s.start = (s.start + 1) % len(s.events)
+		if s.count < len(s.events) {
+			s.count++
+		}
 	}
+	s.mu.Unlock()
+	log.Printf("[USAGE] Loaded %d usage events in %dms (cap %d, restarts no longer duplicate rows)",
+		len(events), time.Since(loadStart).Milliseconds(), maxEvents)
 	return s
 }
 
