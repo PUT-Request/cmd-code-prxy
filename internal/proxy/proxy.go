@@ -163,6 +163,21 @@ type Proxy struct {
 	// it is skipped (it failed recently). Entries expire after
 	// keyCooldownDuration.
 	keyCooldown map[string]time.Time
+
+	// registry serves the live upstream model list (nil = built-in list).
+	registry *ModelRegistry
+	// modelHealth orders free-pool models LRU with per-model cooldown.
+	modelHealth *modelLRU
+	// routerEnabled exposes the free:auto virtual model.
+	routerEnabled bool
+	// routerPool overrides the auto-scanned free pool when non-empty.
+	routerPool []string
+	// routerMaxModels bounds how many models one request may try.
+	routerMaxModels int
+
+	// limitInput/limitOutput bound request size (0 = unlimited).
+	limitInput  int
+	limitOutput int
 }
 
 // NewProxy creates a new proxy instance.
@@ -175,10 +190,41 @@ func NewProxy(keyDefFn func(r *http.Request) *config.APIKeyDef) *Proxy {
 		IdleConnTimeout:       90 * time.Second,
 	}
 	return &Proxy{
-		BaseURL:     defaultBaseURL,
-		Client:      &http.Client{Transport: transport},
-		keyDefFn:    keyDefFn,
-		keyCooldown: make(map[string]time.Time),
+		BaseURL:         defaultBaseURL,
+		Client:          &http.Client{Transport: transport},
+		keyDefFn:        keyDefFn,
+		keyCooldown:     make(map[string]time.Time),
+		modelHealth:     newModelLRU(keyCooldownDuration),
+		routerMaxModels: 5,
+	}
+}
+
+// SetRegistry attaches the live upstream model registry.
+func (p *Proxy) SetRegistry(r *ModelRegistry) { p.registry = r }
+
+// SetRouter configures the free:auto model router. pool overrides the
+// auto-scanned free-model list when non-empty; maxModels bounds per-request
+// failover and cooldown the per-model skip window (<= 0 keeps defaults).
+func (p *Proxy) SetRouter(enabled bool, pool []string, maxModels int, cooldown time.Duration) {
+	p.routerEnabled = enabled
+	p.routerPool = pool
+	if maxModels > 0 {
+		p.routerMaxModels = maxModels
+	}
+	if cooldown > 0 {
+		p.modelHealth.setCooldown(cooldown)
+	}
+}
+
+// SetLimits configures request-size bounds (<= 0 keeps the default).
+func (p *Proxy) SetLimits(inputTokens, outputTokens int) {
+	p.limitInput = DefaultInputTokenLimit
+	p.limitOutput = DefaultOutputTokenLimit
+	if inputTokens > 0 {
+		p.limitInput = inputTokens
+	}
+	if outputTokens > 0 {
+		p.limitOutput = outputTokens
 	}
 }
 
@@ -259,6 +305,14 @@ func (p *Proxy) BuildRequest(openAIReq api.OpenAIChatRequest) (api.CCRequestBody
 	return ccBody, nil
 }
 
+// setCCHeaders applies the CommandCode CLI headers every upstream request
+// needs. Shared by /alpha/generate and the /provider/v1/models registry.
+func setCCHeaders(req *http.Request, ccKey string) {
+	req.Header.Set("Authorization", "Bearer "+ccKey)
+	req.Header.Set("x-command-code-version", version.GetCommandCodeVersion())
+	req.Header.Set("x-cli-environment", "production")
+}
+
 // CreateUpstreamRequest creates a new HTTP request to the CommandCode API
 func (p *Proxy) CreateUpstreamRequest(ctx context.Context, ccBody api.CCRequestBody, ccKey string, bodyJSON []byte) (*http.Request, error) {
 	ccReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
@@ -268,9 +322,7 @@ func (p *Proxy) CreateUpstreamRequest(ctx context.Context, ccBody api.CCRequestB
 	}
 
 	ccReq.Header.Set("Content-Type", "application/json")
-	ccReq.Header.Set("Authorization", "Bearer "+ccKey)
-	ccReq.Header.Set("x-command-code-version", version.GetCommandCodeVersion())
-	ccReq.Header.Set("x-cli-environment", "production")
+	setCCHeaders(ccReq, ccKey)
 	ccReq.Header.Set("Accept", "text/event-stream")
 
 	return ccReq, nil
@@ -289,6 +341,16 @@ func (p *Proxy) CallUpstream(req *http.Request) (*http.Response, error) {
 // Returns the canonical model name and nil error on success.
 func (p *Proxy) allowedModel(keyDef *config.APIKeyDef, requestedModel string) (string, error) {
 	canonical := MapModel(requestedModel)
+
+	// MapModel only covers the built-in short names; if it passed the name
+	// through unchanged, try the live registry (exact ID match, then a
+	// derived short alias) so newly-published upstream models resolve
+	// without a redeploy. The built-in table always wins on conflict.
+	if canonical == requestedModel && p.registry != nil {
+		if resolved, ok := p.registry.Resolve(requestedModel); ok {
+			canonical = resolved
+		}
+	}
 
 	if keyDef == nil || len(keyDef.Models) == 0 {
 		// No restriction.
@@ -340,6 +402,20 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Request-size limits: every model is treated as a 256k-context,
+	// 32k-output model by default; oversized requests are rejected before
+	// any upstream call.
+	if err := p.checkLimits(body, openAIReq); err != nil {
+		p.writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		return
+	}
+	if openAIReq.MaxTokens == nil && openAIReq.MaxCompletionTokens == nil {
+		// Clamp the default output budget to the configured limit; the
+		// old hardcoded 64000 would violate it.
+		v := p.effectiveMaxTokens(openAIReq)
+		openAIReq.MaxTokens = &v
+	}
+
 	// Build CommandCode request (uses canonical model name)
 	openAIReq.Model = canonicalModel
 	ccBody, err := p.BuildRequest(openAIReq)
@@ -348,13 +424,6 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reqJSON, err := json.Marshal(ccBody)
-	if err != nil {
-		p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to build request", "server_error")
-		return
-	}
-	p.debugf("[DEBUG] CommandCode request body: %s", truncateLog(string(reqJSON)))
-
 	// Determine upstream CC keys to try
 	ccKeys := p.ccKeys(keyDef)
 	if len(ccKeys) == 0 {
@@ -362,35 +431,152 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Failover + retry loop.
-	//
-	// Pass 1: try each upstream CC key in turn (healthy keys first, see
-	// orderKeys). ANY upstream failure — including 400s — immediately fails
-	// over to the next key with no sleep, so one bad key neither fails the
-	// request nor adds latency.
-	//
-	// Pass 2: if every key failed with a transient error (transport error,
-	// 429, or 5xx), wait briefly and retry each key once more in LRU order
-	// (least-recently-failed first). Deterministic failures (400/401/403/404)
-	// are not retried — they would fail identically.
-	//
-	// Failed keys cool down for keyCooldownDuration (20 minutes) so later
-	// requests skip them instead of paying for doomed attempts. If ALL keys
-	// are cooling down, they are still tried oldest-failure-first rather
-	// than failing fast.
+	// Candidate models: the requested one, or — for free:auto — the free
+	// pool in LRU-healthy order (bounded failover across models).
+	candidates, cStatus, err := p.candidateModels(canonicalModel)
+	if err != nil {
+		p.writeOpenAIError(w, cStatus, err.Error(), "invalid_request_error")
+		return
+	}
+
+	// Router requests blame a model only if a later model succeeds: a bad
+	// request must not poison the whole pool with cooldowns.
+	var pendingModelFail []string
+
 	var ccResp *http.Response
+	actualModel := candidates[0]
+	lastStatus := http.StatusBadGateway
+	lastMessage := "all upstream keys failed"
+
+	for idx, model := range candidates {
+		ccBody.Params.Model = model
+		reqJSON, err := json.Marshal(ccBody)
+		if err != nil {
+			p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to build request", "server_error")
+			return
+		}
+		p.debugf("[DEBUG] CommandCode request body: %s", truncateLog(string(reqJSON)))
+
+		// Two-pass CC key failover for this model (see tryUpstream).
+		result := p.tryUpstream(r.Context(), ccBody, reqJSON, ccKeys)
+		if result.clientGone {
+			p.writeOpenAIError(w, http.StatusRequestTimeout, "Client disconnected", "api_error")
+			return
+		}
+		if result.buildError != nil {
+			p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to create upstream request", "server_error")
+			return
+		}
+		lastStatus, lastMessage = result.lastStatus, result.lastMessage
+
+		if result.resp != nil {
+			ccResp = result.resp
+			actualModel = model
+			if len(candidates) > 1 {
+				for _, failed := range pendingModelFail {
+					p.modelHealth.MarkFailed(failed)
+				}
+				p.modelHealth.MarkOK(model)
+				log.Printf("[ROUTER] %s → %s", RouterModelID, model)
+			}
+			break
+		}
+		if len(candidates) > 1 {
+			pendingModelFail = append(pendingModelFail, model)
+			log.Printf("[ROUTER] Model %s failed on all CC keys (%d/%d), trying next model",
+				model, idx+1, len(candidates))
+		}
+	}
+
+	if ccResp == nil {
+		// Nobody succeeded: ambiguous 400s blame the request, not the keys.
+		log.Printf("[ERROR] All attempts failed, last error: %d %s", lastStatus, lastMessage)
+		outStatus := http.StatusBadGateway
+		if lastStatus >= http.StatusBadRequest && lastStatus < http.StatusInternalServerError {
+			outStatus = lastStatus
+		}
+		p.writeOpenAIError(w, outStatus, lastMessage, "api_error")
+		return
+	}
+	defer ccResp.Body.Close()
+
+	requestID := "chatcmpl-" + uuid.New().String()[:29]
+	created := time.Now().Unix()
+	clientFingerprint := clientKeyFingerprint(keyDef)
+
+	if openAIReq.Stream {
+		p.StreamResponse(w, r, ccResp, requestID, actualModel, created, clientFingerprint)
+	} else {
+		p.NonStreamResponse(w, ccResp, requestID, actualModel, created, clientFingerprint)
+	}
+}
+
+// candidateModels returns the models to try for a request, in order. A
+// direct model request returns exactly one entry (unchanged behavior);
+// free:auto returns the free pool in LRU-healthy order, bounded by the
+// configured per-request cap.
+func (p *Proxy) candidateModels(canonicalModel string) ([]string, int, error) {
+	if !IsRouterModel(canonicalModel) {
+		return []string{canonicalModel}, http.StatusOK, nil
+	}
+	if !p.routerEnabled {
+		return nil, http.StatusBadRequest, fmt.Errorf("model %q is disabled; set router.enabled in config.yaml", RouterModelID)
+	}
+	pool := p.routerPool
+	if len(pool) == 0 && p.registry != nil {
+		pool = p.registry.FreeModels()
+	}
+	if len(pool) == 0 {
+		return nil, http.StatusServiceUnavailable, fmt.Errorf("no free models available")
+	}
+	candidates := p.modelHealth.Candidates(pool)
+	if p.routerMaxModels > 0 && len(candidates) > p.routerMaxModels {
+		candidates = candidates[:p.routerMaxModels]
+	}
+	return candidates, http.StatusOK, nil
+}
+
+// upstreamResult is the outcome of the two-pass CC key failover loop.
+type upstreamResult struct {
+	// resp is the successful upstream response (body still open).
+	resp *http.Response
+	// lastStatus/lastMessage carry the most recent failure.
+	lastStatus  int
+	lastMessage string
+	// clientGone reports the caller disconnected; the HTTP response has
+	// not been written.
+	clientGone bool
+	// buildError is a request-construction failure (fatal, not retriable).
+	buildError error
+}
+
+// tryUpstream runs the two-pass CC key failover for one upstream request.
+//
+// Pass 1: try each upstream CC key in turn (healthy keys first, see
+// orderKeys). ANY upstream failure — including 400s — immediately fails
+// over to the next key with no sleep, so one bad key neither fails the
+// request nor adds latency.
+//
+// Pass 2: if every key failed with a transient error (transport error,
+// 429, or 5xx), wait briefly and retry each key once more in LRU order
+// (least-recently-failed first). Deterministic failures (400/401/403/404)
+// are not retried — they would fail identically.
+//
+// Failed keys cool down for keyCooldownDuration (20 minutes) so later
+// requests skip them instead of paying for doomed attempts. If ALL keys
+// are cooling down, they are still tried oldest-failure-first rather
+// than failing fast.
+func (p *Proxy) tryUpstream(ctx context.Context, ccBody api.CCRequestBody, reqJSON []byte, ccKeys []string) upstreamResult {
+	res := upstreamResult{lastStatus: http.StatusBadGateway, lastMessage: "all upstream keys failed"}
 	// pendingCooldown holds keys that failed with an ambiguous status (400,
 	// 404, 422: could be the key or the request itself). They only cool down
 	// if another key succeeds; if every key fails, the request is blamed and
 	// no cooldown is applied.
 	var pendingCooldown []string
-	// lastStatus/lastMessage carry the most recent failure for the final
-	// error response.
-	lastStatus := http.StatusBadGateway
-	lastMessage := "all upstream keys failed"
 	transientSeen := false
 	succeeded := false
 
+	var ccResp *http.Response
 	ordered := p.orderKeys(ccKeys)
 	for round := 0; round < 2 && !succeeded; round++ {
 		if round == 1 {
@@ -399,37 +585,37 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			log.Printf("[RETRY] All %d CC keys failed with transient errors, retrying each key once", len(ordered))
 			select {
-			case <-r.Context().Done():
-				p.writeOpenAIError(w, http.StatusRequestTimeout, "Client disconnected during retry", "api_error")
-				return
+			case <-ctx.Done():
+				res.clientGone = true
+				return res
 			case <-time.After(retryRoundBackoff):
 			}
 			ordered = p.orderKeys(ccKeys)
 		}
 
 		for i, ccKey := range ordered {
-			if r.Context().Err() != nil {
-				p.writeOpenAIError(w, http.StatusRequestTimeout, "Client disconnected", "api_error")
-				return
+			if ctx.Err() != nil {
+				res.clientGone = true
+				return res
 			}
 
-			ccReq, err := p.CreateUpstreamRequest(r.Context(), ccBody, ccKey, reqJSON)
+			ccReq, err := p.CreateUpstreamRequest(ctx, ccBody, ccKey, reqJSON)
 			if err != nil {
-				p.writeOpenAIError(w, http.StatusInternalServerError, "Failed to create upstream request", "server_error")
-				return
+				res.buildError = err
+				return res
 			}
 
 			ccResp, err = p.CallUpstream(ccReq)
 			if err != nil {
 				ccResp = nil
-				if r.Context().Err() != nil {
-					p.writeOpenAIError(w, http.StatusRequestTimeout, "Client disconnected", "api_error")
-					return
+				if ctx.Err() != nil {
+					res.clientGone = true
+					return res
 				}
 				p.markKeyFailed(ccKey)
 				transientSeen = true
-				lastStatus = http.StatusBadGateway
-				lastMessage = fmt.Sprintf("Upstream error: %s", err.Error())
+				res.lastStatus = http.StatusBadGateway
+				res.lastMessage = fmt.Sprintf("Upstream error: %s", err.Error())
 				log.Printf("[RETRY] Transport error with CC key %s (%d/%d), trying next key: %v",
 					keyFingerprint(ccKey), i+1, len(ordered), err)
 				continue
@@ -451,8 +637,8 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			errBody, _ := io.ReadAll(io.LimitReader(ccResp.Body, errBodyReadLimit))
 			ccResp.Body.Close()
 			ccResp = nil
-			lastStatus = status
-			lastMessage = fmt.Sprintf("Upstream error: %s", string(errBody))
+			res.lastStatus = status
+			res.lastMessage = fmt.Sprintf("Upstream error: %s", string(errBody))
 			if isAmbiguousStatus(status) {
 				// Might be this key, might be the request — decide on success.
 				pendingCooldown = append(pendingCooldown, ccKey)
@@ -472,25 +658,11 @@ func (p *Proxy) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !succeeded {
 		// Nobody succeeded: ambiguous 400s blame the request, not the keys.
 		pendingCooldown = nil
-		log.Printf("[ERROR] All %d CC keys failed, last error: %d %s", len(ordered), lastStatus, lastMessage)
-		outStatus := http.StatusBadGateway
-		if lastStatus >= http.StatusBadRequest && lastStatus < http.StatusInternalServerError {
-			outStatus = lastStatus
-		}
-		p.writeOpenAIError(w, outStatus, lastMessage, "api_error")
-		return
+		log.Printf("[ERROR] All %d CC keys failed, last error: %d %s", len(ordered), res.lastStatus, res.lastMessage)
+		return res
 	}
-	defer ccResp.Body.Close()
-
-	requestID := "chatcmpl-" + uuid.New().String()[:29]
-	created := time.Now().Unix()
-	clientFingerprint := clientKeyFingerprint(keyDef)
-
-	if openAIReq.Stream {
-		p.StreamResponse(w, r, ccResp, requestID, ccBody.Params.Model, created, clientFingerprint)
-	} else {
-		p.NonStreamResponse(w, ccResp, requestID, ccBody.Params.Model, created, clientFingerprint)
-	}
+	res.resp = ccResp
+	return res
 }
 
 // clientKeyFingerprint returns a display-safe identifier for the authenticated
@@ -1317,6 +1489,14 @@ func countImageURLs(msgs []api.OpenAIMessage) int {
 					}
 				}
 			}
+		case []api.ContentPart:
+			// Typed shape (not produced by json.Unmarshal, but callers may
+			// construct requests directly).
+			for _, part := range v {
+				if part.Type == "image_url" || part.Type == "input_image" || part.Type == "image" {
+					n++
+				}
+			}
 		}
 	}
 	return n
@@ -1327,35 +1507,29 @@ func countImageURLs(msgs []api.OpenAIMessage) int {
 func (p *Proxy) HandleModels(w http.ResponseWriter, r *http.Request) {
 	keyDef := p.keyDefFn(r)
 
-	allModels := []api.OpenAIModel{
-		// MoonshotAI
-		{ID: "moonshotai/Kimi-K2.6", Object: "model", Created: 0, OwnedBy: "moonshotai"},
-		{ID: "moonshotai/Kimi-K2.5", Object: "model", Created: 0, OwnedBy: "moonshotai"},
-		// ZhipuAI
-		{ID: "zai-org/GLM-5.1", Object: "model", Created: 0, OwnedBy: "zhipuai"},
-		{ID: "zai-org/GLM-5", Object: "model", Created: 0, OwnedBy: "zhipuai"},
-		// MiniMaxAI
-		{ID: "MiniMaxAI/MiniMax-M2.7", Object: "model", Created: 0, OwnedBy: "minimaxai"},
-		{ID: "MiniMaxAI/MiniMax-M2.5", Object: "model", Created: 0, OwnedBy: "minimaxai"},
-		{ID: "MiniMaxAI/MiniMax-M3", Object: "model", Created: 0, OwnedBy: "minimaxai"},
-		// DeepSeek
-		{ID: "deepseek/deepseek-v4-pro", Object: "model", Created: 0, OwnedBy: "deepseek"},
-		{ID: "deepseek/deepseek-v4-flash", Object: "model", Created: 0, OwnedBy: "deepseek"},
-		// Qwen
-		{ID: "Qwen/Qwen3.6-Max-Preview", Object: "model", Created: 0, OwnedBy: "qwen"},
-		{ID: "Qwen/Qwen3.6-Plus", Object: "model", Created: 0, OwnedBy: "qwen"},
-		// StepFun
-		{ID: "stepfun/Step-3.5-Flash", Object: "model", Created: 0, OwnedBy: "stepfun"},
-		{ID: "stepfun/Step-3.7-Flash", Object: "model", Created: 0, OwnedBy: "stepfun"},
-		// Qwen (3.7 line)
-		{ID: "Qwen/Qwen3.7-Max-Free", Object: "model", Created: 0, OwnedBy: "qwen"},
-		{ID: "Qwen/Qwen3.7-Max", Object: "model", Created: 0, OwnedBy: "qwen"},
-		// Xiaomi MiMo
-		{ID: "xiaomi/mimo-v2.5-pro", Object: "model", Created: 0, OwnedBy: "xiaomi"},
-		{ID: "xiaomi/mimo-v2.5", Object: "model", Created: 0, OwnedBy: "xiaomi"},
-		// Google
-		{ID: "google/gemini-3.1-flash-lite", Object: "model", Created: 0, OwnedBy: "google"},
+	var allModels []api.OpenAIModel
+	if p.registry != nil {
+		allModels = p.registry.Models()
+	} else {
+		allModels = defaultModels
 	}
+
+	// Copy so we never mutate the registry's slice, and advertise the
+	// proxy-enforced context bound so clients budget correctly.
+	out := make([]api.OpenAIModel, len(allModels))
+	copy(out, allModels)
+	for i := range out {
+		out[i].ContextLength = p.contextLimit()
+	}
+	if p.routerEnabled {
+		out = append(out, api.OpenAIModel{
+			ID:            RouterModelID,
+			Object:        "model",
+			OwnedBy:       "commandcode-proxy",
+			ContextLength: p.contextLimit(),
+		})
+	}
+	allModels = out
 
 	// Filter by allowed models if the key has a restriction
 	if keyDef != nil && len(keyDef.Models) > 0 {

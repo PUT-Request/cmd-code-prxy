@@ -147,6 +147,9 @@ type OpenAIModel struct {
 	Object  string `json:"object"`
 	Created int64  `json:"created"`
 	OwnedBy string `json:"owned_by"`
+	// ContextLength advertises the proxy-enforced context bound so clients
+	// do not budget against upstream's much larger numbers.
+	ContextLength int `json:"context_length,omitempty"`
 }
 
 type OpenAIModelList struct {

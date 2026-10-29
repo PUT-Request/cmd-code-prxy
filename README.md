@@ -14,6 +14,10 @@ Version: `v1.0.8`
 - OpenAI-compatible model list endpoint
 - Short model name mapping
 - YAML configuration file (`config.yaml`)
+- `free:auto` model router: routes requests across the free-model pool with
+  LRU rotation, per-model cooldown, and failover to the next model
+- Live `/v1/models` refreshed from the upstream provider list
+- Request-size limits (256k input / 32k output by default)
 - Multiple client API keys, each with a model allowlist
 - Upstream key failover: any upstream error (including 400) retries the
   next key; failed keys cool down for 20 minutes
@@ -116,6 +120,24 @@ api_keys:
 #   password: "change-me"
 #   session_hours: 24
 #   db_path: "usage.db"   # SQLite file for token usage; empty = memory only
+
+# Live upstream model list: /v1/models is refreshed from the CommandCode
+# provider API (falls back to a built-in list if unreachable).
+models:
+  refresh_seconds: 300
+
+# Built-in free:auto router: routes each request across the free-model pool.
+router:
+  enabled: true
+  cooldown_minutes: 20       # skip a failed model for this long
+  max_models_per_request: 5  # bounded failover across models per request
+  models: []                 # optional explicit pool; empty = IDs containing "free"
+
+# Request-size limits. Every model is treated as non-vision with this
+# context bound; larger requests are rejected before reaching upstream.
+limits:
+  input_tokens: 256000
+  output_tokens: 32000
 
 # Enable verbose debug logging of request/response bodies.
 debug: false
@@ -280,6 +302,68 @@ On `/v1/responses`, use the Responses shape instead: `"reasoning": {"effort": "h
 When a client replays assistant history, `reasoning_content` must be echoed back
 (it is emitted as a leading `reasoning` block). The upstream validates the
 thinking round-trip and rejects requests whose reasoning is missing.
+
+## Model router (`free:auto`)
+
+`free:auto` (aliases `auto`, `free`) is a virtual model that routes each
+request across the pool of free upstream models instead of pinning one.
+Enable it with `router.enabled: true`.
+
+```bash
+curl http://127.0.0.1:55990/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-client-key" \
+  -d '{
+    "model": "free:auto",
+    "messages": [{"role": "user", "content": "hi"}]
+  }'
+```
+
+How a model is chosen:
+
+- The pool defaults to every registry model whose ID contains `free`. Set
+  `router.models` to an explicit list to override it.
+- Models are tried LRU-healthy order: healthy models rotate (each success
+  moves a model to the back), cooling models sort to the back.
+- If a model fails on all upstream keys, the request fails over to the next
+  model in the pool, up to `max_models_per_request` (default 5). Failover
+  happens before any bytes are sent to the client.
+- A model that fails cools down for `cooldown_minutes` (default 20) so later
+  requests skip it. Keys and models cool down independently — a key failure
+  retries the next key within the same model; a model failure moves to the
+  next model.
+- A bad request (all models reject it) is blamed on the request, not the
+  pool, so no cooldowns are applied.
+
+`free:auto` is a valid value in a key's `models` allowlist and is listed by
+`/v1/models` when the router is enabled. Usage stats record the real model
+that served each request, not `free:auto`. Requests pinned to a concrete
+model (e.g. `gpt-5.5`) behave exactly as before — no model failover.
+
+## Live model list
+
+`/v1/models` is served from the live upstream provider list
+(`/provider/v1/models`), refreshed every `models.refresh_seconds` (default
+300) in the background and on demand. Short aliases resolve against this
+current list, so newly published upstream models work without a redeploy.
+
+If the fetch fails, the last good list is kept; on a cold start with no
+reachable upstream, a built-in list is served so the endpoint never breaks.
+Each entry advertises `context_length` equal to the configured input limit
+(256k by default) so clients budget against the bound the proxy actually
+enforces.
+
+## Request-size limits
+
+Every model is treated as non-vision with a 256k-token context and a
+32k-token output cap by default (`limits.input_tokens` / `limits.output_tokens`).
+Requests are checked before any upstream call:
+
+- Estimated input above the limit → `400`. The estimate strips base64 image
+  payloads (they are not transmitted as text tokens) and adds a flat
+  per-image vision cost.
+- `max_tokens` above the output limit → `400`. When the client omits
+  `max_tokens`, the default is clamped to the output limit.
 
 ## Supported model aliases
 

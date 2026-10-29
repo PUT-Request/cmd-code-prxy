@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/dev2k6/command-code-proxy-server/internal/config"
@@ -104,6 +105,23 @@ func main() {
 	srv := server.NewServer(keyMap, p, mount...)
 	srv.SetPort(cfg.Port)
 	srv.SetHost(cfg.Host)
+
+	// Request-size limits (defaults: 256k input, 32k output).
+	p.SetLimits(cfg.Limits.InputTokens, cfg.Limits.OutputTokens)
+
+	// Live model registry: refreshes /v1/models from the upstream provider
+	// list and feeds the free:auto router pool.
+	registry := proxy.NewRegistry(p.BaseURL, srv.UpstreamKeys,
+		time.Duration(cfg.Models.RefreshSeconds)*time.Second)
+	p.SetRegistry(registry)
+	registry.Refresh() // best-effort warm-up; failures fall back to defaults
+
+	// free:auto router over the free-model pool (IDs containing "free").
+	p.SetRouter(cfg.Router.Enabled, cfg.Router.Models, cfg.Router.MaxModelsPerRequest,
+		time.Duration(cfg.Router.CooldownMinutes)*time.Minute)
+	if cfg.Router.Enabled {
+		log.Printf("[ROUTER] free:auto enabled (pool: %s)", strings.Join(registry.FreeModels(), ", "))
+	}
 
 	// Dashboard key edits must take effect immediately: after persisting to
 	// config.yaml, refresh the server's live key map.

@@ -30,6 +30,32 @@ type DashboardConfig struct {
 	DBPath string `yaml:"db_path"`
 }
 
+// ModelsConfig controls the upstream model-list registry (live /v1/models).
+type ModelsConfig struct {
+	// RefreshSeconds is how often the upstream model list is re-fetched.
+	RefreshSeconds int `yaml:"refresh_seconds"`
+}
+
+// RouterConfig controls the built-in free:auto model router.
+type RouterConfig struct {
+	// Enabled exposes the free:auto virtual model (routes across free models).
+	Enabled bool `yaml:"enabled"`
+	// CooldownMinutes is how long a failed model is skipped.
+	CooldownMinutes int `yaml:"cooldown_minutes"`
+	// MaxModelsPerRequest caps how many models one request may try before
+	// giving up (bounded failover).
+	MaxModelsPerRequest int `yaml:"max_models_per_request"`
+	// Models overrides the auto-scanned free pool when non-empty.
+	Models []string `yaml:"models"`
+}
+
+// LimitsConfig bounds request size. Zero falls back to the defaults
+// (256k input, 32k output).
+type LimitsConfig struct {
+	InputTokens  int `yaml:"input_tokens"`
+	OutputTokens int `yaml:"output_tokens"`
+}
+
 // Config holds all runtime configuration for the proxy server.
 type Config struct {
 	Host      string          `yaml:"host"`
@@ -37,6 +63,9 @@ type Config struct {
 	APIKeys   []APIKeyDef     `yaml:"api_keys"`
 	Debug     bool            `yaml:"debug"`
 	Dashboard DashboardConfig `yaml:"dashboard"`
+	Models    ModelsConfig    `yaml:"models"`
+	Router    RouterConfig    `yaml:"router"`
+	Limits    LimitsConfig    `yaml:"limits"`
 
 	// BaseURL overrides the CommandCode API endpoint. Empty uses the default.
 	BaseURL string `yaml:"base_url"`

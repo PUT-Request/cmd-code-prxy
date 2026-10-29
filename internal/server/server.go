@@ -62,6 +62,25 @@ func (s *Server) lookup(key string) (*config.APIKeyDef, bool) {
 	return def, ok
 }
 
+// UpstreamKeys returns every distinct upstream CommandCode key across all
+// client key definitions. It lets the model registry rotate keys on 401 and
+// reflects live dashboard edits. Never returns raw keys to a client.
+func (s *Server) UpstreamKeys() []string {
+	s.keyMu.RLock()
+	defer s.keyMu.RUnlock()
+	seen := make(map[string]bool)
+	var out []string
+	for _, def := range s.keyMap {
+		for _, k := range def.CommandCodeKeys {
+			if k != "" && !seen[k] {
+				seen[k] = true
+				out = append(out, k)
+			}
+		}
+	}
+	return out
+}
+
 // NewServer creates a new server instance with auth and routing wired up.
 // mount, when non-nil, registers additional routes (the dashboard) on the same
 // mux before auth is applied, so it manages its own access control.
